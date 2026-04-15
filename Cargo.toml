@@ -12,8 +12,9 @@ path = "src/main.rs"
 [dependencies]
 quiche = { version = "0.22", features = ["boringssl-vendored"] }
 octets = "0.3"
+bytes = "1"
 
-tokio = { version = "1", features = ["io-util", "net", "macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "net", "macros", "rt-multi-thread", "time", "sync"] }
 mio = { version = "1", features = ["net", "os-poll"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
