@@ -57,6 +57,11 @@ pub fn prepare_tls_material(config: &Config) -> Result<TlsMaterial> {
     })
 }
 
+/// Validate that TLS material can be built from the MASQUE config.
+pub fn validate_config(config: &Config) -> Result<()> {
+    prepare_tls_material(config).map(|_| ())
+}
+
 /// Verify a peer's DER certificate against the pinned SPKI public key.
 /// Returns true if the peer cert's `SubjectPublicKeyInfo` matches.
 pub fn verify_endpoint_key(peer_cert_der: &[u8], expected_spki_der: &[u8]) -> bool {

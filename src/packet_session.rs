@@ -8,17 +8,19 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::config::Config;
 use crate::packet;
 use crate::tls;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+const DEFAULT_QUEUE_CAPACITY: usize = 32768;
 
 #[derive(Debug, Clone)]
 pub struct PacketSessionConfig {
     pub endpoint: SocketAddr,
+    pub bind: Option<SocketAddr>,
     pub sni: String,
     pub keepalive_period: Duration,
     pub mtu: u32,
@@ -183,10 +185,12 @@ async fn run_packet_session_once(
         }
     };
 
-    let bind_addr: SocketAddr = match session_cfg.endpoint {
-        SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-        SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
-    };
+    let bind_addr: SocketAddr = session_cfg
+        .bind
+        .unwrap_or_else(|| match session_cfg.endpoint {
+            SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+            SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+        });
 
     let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
         Ok(socket) => socket,
@@ -476,7 +480,7 @@ async fn wait_for_connect_response(
                 Err(error) => {
                     return Some(SessionLoopOutcome::Reconnect(format!(
                         "h3 poll error: {error}"
-                    )))
+                    )));
                 }
             }
         }
@@ -551,6 +555,8 @@ async fn run_connected_loop(
             }
         }
 
+        flush_pending_queue(conn, flow_prefix, queue);
+
         while let Ok(len) = socket.try_recv(buf) {
             let recv_info = quiche::RecvInfo {
                 to: local_addr,
@@ -564,7 +570,7 @@ async fn run_connected_loop(
                 Ok(_) => {}
                 Err(quiche::h3::Error::Done) => break,
                 Err(error) => {
-                    return SessionLoopOutcome::Reconnect(format!("h3 poll error: {error}"))
+                    return SessionLoopOutcome::Reconnect(format!("h3 poll error: {error}"));
                 }
             }
         }
@@ -575,15 +581,27 @@ async fn run_connected_loop(
                     if let Some(offset) = parse_datagram_offset(&dgram, 0) {
                         let dgram = Bytes::from(dgram);
                         let packet = dgram.slice(offset..);
-                        if packet::validate_incoming(packet.as_ref()).is_ok()
-                            && event_tx
-                                .send(PacketSessionEvent::Packet(packet))
-                                .await
-                                .is_err()
-                        {
-                            return SessionLoopOutcome::Close(
-                                PacketSessionCloseReason::OutputClosed,
-                            );
+                        if packet::validate_incoming(packet.as_ref()).is_ok() {
+                            match event_tx.try_send(PacketSessionEvent::Packet(packet)) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(PacketSessionEvent::Packet(packet))) => {
+                                    log::warn!(
+                                        "dropping incoming MASQUE packet because bridge event queue is full: {} bytes",
+                                        packet.len()
+                                    );
+                                }
+                                Err(TrySendError::Closed(PacketSessionEvent::Packet(_))) => {
+                                    return SessionLoopOutcome::Close(
+                                        PacketSessionCloseReason::OutputClosed,
+                                    );
+                                }
+                                Err(TrySendError::Full(_)) => {}
+                                Err(TrySendError::Closed(_)) => {
+                                    return SessionLoopOutcome::Close(
+                                        PacketSessionCloseReason::OutputClosed,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
