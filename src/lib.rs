@@ -31,3 +31,6 @@ pub mod register;
 pub mod tls;
 pub mod tun_device;
 pub mod tunnel;
+mod udp_socket;
+
+pub use packet_session::MasquePacketStream;

@@ -1,18 +1,22 @@
 use anyhow::{bail, Result};
 use bytes::Bytes;
+use futures::{Future, Sink, Stream};
 use octets::Octets;
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use std::collections::VecDeque;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
-use tokio::sync::mpsc::error::TrySendError;
+use tokio::time::{Instant, Sleep};
 
 use crate::config::Config;
 use crate::packet;
 use crate::tls;
+use crate::udp_socket::bind_udp_socket;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const DEFAULT_QUEUE_CAPACITY: usize = 32768;
@@ -37,306 +41,512 @@ pub enum PacketSessionState {
 }
 
 #[derive(Debug, Clone)]
-pub enum PacketSessionCloseReason {
-    Requested,
-    InputClosed,
-    OutputClosed,
-    InternalError(String),
-}
-
-#[derive(Debug)]
-pub enum PacketSessionEvent {
-    Packet(Bytes),
-    Closed(PacketSessionCloseReason),
-}
-
-#[derive(Debug, Clone)]
-pub enum PacketSessionControl {
-    Close,
-}
-
-pub struct PacketSessionHandle {
-    pub packet_tx: mpsc::Sender<Bytes>,
-    pub event_rx: mpsc::Receiver<PacketSessionEvent>,
-    pub state_rx: watch::Receiver<PacketSessionState>,
-    pub control_tx: mpsc::Sender<PacketSessionControl>,
-}
-
 enum SessionLoopOutcome {
     Reconnect(String),
-    Close(PacketSessionCloseReason),
 }
 
-pub fn start_packet_session(
-    config: Arc<Config>,
-    session_cfg: PacketSessionConfig,
-) -> PacketSessionHandle {
-    let (packet_tx, packet_rx) = mpsc::channel(DEFAULT_QUEUE_CAPACITY);
-    let (event_tx, event_rx) = mpsc::channel(DEFAULT_QUEUE_CAPACITY);
-    let (control_tx, control_rx) = mpsc::channel(8);
-    let (state_tx, state_rx) = watch::channel(PacketSessionState::Idle);
-
-    tokio::spawn(run_packet_session_manager(
-        config,
-        session_cfg,
-        packet_rx,
-        event_tx,
-        control_rx,
-        state_tx,
-    ));
-
-    PacketSessionHandle {
-        packet_tx,
-        event_rx,
-        state_rx,
-        control_tx,
+impl SessionLoopOutcome {
+    fn into_message(self) -> String {
+        match self {
+            Self::Reconnect(reason) => reason,
+        }
     }
 }
 
-async fn run_packet_session_manager(
-    config: Arc<Config>,
-    session_cfg: PacketSessionConfig,
-    mut packet_rx: mpsc::Receiver<Bytes>,
-    event_tx: mpsc::Sender<PacketSessionEvent>,
-    mut control_rx: mpsc::Receiver<PacketSessionControl>,
-    state_tx: watch::Sender<PacketSessionState>,
-) {
-    let mut pending_packet: Option<Bytes> = None;
+pub struct MasquePacketStream {
+    socket: tokio::net::UdpSocket,
+    conn: quiche::Connection,
+    h3_conn: quiche::h3::Connection,
+    flow_prefix: Vec<u8>,
+    outbound_queue: VecDeque<Bytes>,
+    inbound_queue: VecDeque<Bytes>,
+    out: Vec<u8>,
+    buf: Vec<u8>,
+    local_addr: SocketAddr,
+    endpoint: SocketAddr,
+    keepalive_period: Duration,
+    state: PacketSessionState,
+    timeout: Pin<Box<Sleep>>,
+    pending_send: Option<PendingUdpSend>,
+    terminal_error: Option<String>,
+    emitted_terminal_error: bool,
+}
 
-    loop {
-        if pending_packet.is_none() {
-            let _ = state_tx.send(PacketSessionState::Idle);
-            tokio::select! {
-                maybe_packet = packet_rx.recv() => {
-                    match maybe_packet {
-                        Some(packet) => pending_packet = Some(packet),
-                        None => {
-                            emit_closed(&event_tx, &state_tx, PacketSessionCloseReason::InputClosed).await;
-                            return;
-                        }
-                    }
-                }
-                maybe_control = control_rx.recv() => {
-                    if matches!(maybe_control, Some(PacketSessionControl::Close)) {
-                        emit_closed(&event_tx, &state_tx, PacketSessionCloseReason::Requested).await;
-                        return;
-                    }
-                }
-            }
-        }
+struct PendingUdpSend {
+    len: usize,
+    to: SocketAddr,
+}
 
-        match run_packet_session_once(
-            config.as_ref(),
-            &session_cfg,
-            &mut pending_packet,
-            &mut packet_rx,
-            &event_tx,
-            &mut control_rx,
-            &state_tx,
+impl MasquePacketStream {
+    pub async fn connect(config: Arc<Config>, session_cfg: PacketSessionConfig) -> Result<Self> {
+        let tls_material = tls::prepare_tls_material(config.as_ref())?;
+        let mut quic_config = build_quic_config(&tls_material)?;
+
+        let bind_addr: SocketAddr =
+            session_cfg
+                .bind
+                .unwrap_or_else(|| match session_cfg.endpoint {
+                    SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+                    SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+                });
+
+        let socket = bind_udp_socket(bind_addr, "masque-packet-stream")?;
+        socket.connect(session_cfg.endpoint).await?;
+        let local_addr = socket.local_addr()?;
+
+        let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+        ring::rand::SystemRandom::new()
+            .fill(&mut scid)
+            .map_err(|_| anyhow::anyhow!("RNG failure"))?;
+        let scid = quiche::ConnectionId::from_ref(&scid);
+
+        let mut conn = quiche::connect(
+            Some(&session_cfg.sni),
+            &scid,
+            local_addr,
+            session_cfg.endpoint,
+            &mut quic_config,
+        )?;
+
+        let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
+        let mut buf = vec![0u8; 65535];
+
+        flush_conn_send(&socket, &mut conn, &mut out).await?;
+
+        if let Some(outcome) = complete_handshake(
+            &socket,
+            &mut conn,
+            &mut out,
+            &mut buf,
+            local_addr,
+            session_cfg.endpoint,
         )
         .await
         {
-            SessionLoopOutcome::Reconnect(reason) => {
-                log::warn!("packet session reconnecting: {reason}");
-                let _ = state_tx.send(PacketSessionState::Reconnecting);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            return Err(anyhow::anyhow!(outcome.into_message()));
+        }
+
+        if let Some(peer_cert) = conn.peer_cert() {
+            if !tls::verify_endpoint_key(peer_cert, &tls_material.endpoint_pub_key_spki_der) {
+                bail!("peer certificate public key does not match pinned endpoint key");
             }
-            SessionLoopOutcome::Close(reason) => {
-                emit_closed(&event_tx, &state_tx, reason).await;
-                return;
+        }
+
+        let mut h3_config = quiche::h3::Config::new()?;
+        h3_config.enable_extended_connect(true);
+
+        let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
+
+        let req = vec![
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
+            quiche::h3::Header::new(b":path", b"/"),
+            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+            quiche::h3::Header::new(b"user-agent", b""),
+        ];
+
+        let stream_id = h3_conn.send_request(&mut conn, &req, false)?;
+        let flow_id = stream_id / 4;
+
+        flush_conn_send(&socket, &mut conn, &mut out).await?;
+
+        if let Some(outcome) = wait_for_connect_response(
+            &socket,
+            &mut conn,
+            &mut h3_conn,
+            &mut out,
+            &mut buf,
+            local_addr,
+            session_cfg.endpoint,
+            stream_id,
+        )
+        .await
+        {
+            return Err(anyhow::anyhow!(outcome.into_message()));
+        }
+
+        let mut stream = Self {
+            socket,
+            conn,
+            h3_conn,
+            flow_prefix: build_flow_prefix(flow_id),
+            outbound_queue: VecDeque::new(),
+            inbound_queue: VecDeque::new(),
+            out,
+            buf,
+            local_addr,
+            endpoint: session_cfg.endpoint,
+            keepalive_period: session_cfg.keepalive_period,
+            state: PacketSessionState::Ready,
+            timeout: Box::pin(tokio::time::sleep(Duration::from_millis(0))),
+            pending_send: None,
+            terminal_error: None,
+            emitted_terminal_error: false,
+        };
+        stream.reset_timeout();
+        Ok(stream)
+    }
+
+    pub fn state(&self) -> PacketSessionState {
+        self.state
+    }
+
+    pub async fn close(&mut self) -> io::Result<()> {
+        futures::future::poll_fn(|cx| Pin::new(&mut *self).poll_close(cx)).await
+    }
+
+    fn reset_timeout(&mut self) {
+        let deadline = Instant::now() + self.current_timeout();
+        self.timeout.as_mut().reset(deadline);
+    }
+
+    fn current_timeout(&self) -> Duration {
+        self.conn
+            .timeout()
+            .unwrap_or(self.keepalive_period)
+            .min(self.keepalive_period)
+    }
+
+    fn set_terminal_error(&mut self, error: impl Into<String>) {
+        self.state = PacketSessionState::Closed;
+        if self.terminal_error.is_none() {
+            self.terminal_error = Some(error.into());
+        }
+    }
+
+    fn terminal_io_error(&self) -> io::Error {
+        io::Error::other(
+            self.terminal_error
+                .clone()
+                .unwrap_or_else(|| "MASQUE stream closed".to_string()),
+        )
+    }
+
+    fn closed_io_error(&self) -> io::Error {
+        io::Error::new(io::ErrorKind::BrokenPipe, "MASQUE stream closed")
+    }
+
+    fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut progressed = false;
+
+        loop {
+            let mut made_progress = false;
+
+            made_progress |=
+                flush_pending_queue(&mut self.conn, &self.flow_prefix, &mut self.outbound_queue);
+            match self.poll_flush_conn_send(cx) {
+                Poll::Ready(Ok(flushed)) => made_progress |= flushed,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+
+            match self.poll_recv_udp(cx) {
+                Poll::Ready(Ok(received)) => made_progress |= received,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+
+            made_progress |= self.poll_h3_events()?;
+            made_progress |= self.poll_incoming_datagrams()?;
+
+            if self.timeout.as_mut().poll(cx).is_ready() {
+                self.conn.on_timeout();
+                self.reset_timeout();
+                made_progress = true;
+            }
+
+            match self.poll_flush_conn_send(cx) {
+                Poll::Ready(Ok(flushed)) => made_progress |= flushed,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+
+            if self.conn.is_closed() {
+                return Poll::Ready(Err(io::Error::other("MASQUE connection closed")));
+            }
+
+            if !made_progress {
+                return if progressed {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                };
+            }
+
+            progressed = true;
+        }
+    }
+
+    fn poll_recv_udp(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        let mut received = false;
+
+        loop {
+            match self.socket.poll_recv_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {
+                    return if received {
+                        Poll::Ready(Ok(true))
+                    } else {
+                        Poll::Pending
+                    };
+                }
+            }
+
+            loop {
+                match self.socket.try_recv(&mut self.buf) {
+                    Ok(len) => {
+                        let recv_info = quiche::RecvInfo {
+                            to: self.local_addr,
+                            from: self.endpoint,
+                        };
+                        if let Err(error) = self.conn.recv(&mut self.buf[..len], recv_info) {
+                            log::debug!("quic recv error: {error}");
+                        }
+                        received = true;
+                        self.reset_timeout();
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Poll::Ready(Err(error)),
+                }
+            }
+        }
+    }
+
+    fn poll_flush_conn_send(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        let mut flushed = false;
+
+        loop {
+            if self.pending_send.is_none() {
+                match self.socket.poll_send_ready(cx) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => {
+                        return if flushed {
+                            Poll::Ready(Ok(true))
+                        } else {
+                            Poll::Pending
+                        };
+                    }
+                }
+
+                let (write, send_info) = match self.conn.send(&mut self.out) {
+                    Ok(result) => result,
+                    Err(quiche::Error::Done) => return Poll::Ready(Ok(flushed)),
+                    Err(error) => return Poll::Ready(Err(io::Error::other(error.to_string()))),
+                };
+
+                self.pending_send = Some(PendingUdpSend {
+                    len: write,
+                    to: send_info.to,
+                });
+                self.reset_timeout();
+            }
+
+            let pending = self.pending_send.as_ref().unwrap();
+            if pending.to != self.endpoint {
+                return Poll::Ready(Err(io::Error::other(format!(
+                    "unexpected QUIC send target {} (expected {})",
+                    pending.to, self.endpoint
+                ))));
+            }
+
+            match self.socket.try_send(&self.out[..pending.len]) {
+                Ok(sent) if sent == pending.len => {
+                    self.pending_send = None;
+                    flushed = true;
+                }
+                Ok(_) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "partial UDP send",
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return if flushed {
+                        Poll::Ready(Ok(true))
+                    } else {
+                        Poll::Pending
+                    };
+                }
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+    }
+
+    fn poll_h3_events(&mut self) -> io::Result<bool> {
+        let mut progressed = false;
+
+        loop {
+            match self.h3_conn.poll(&mut self.conn) {
+                Ok(_) => progressed = true,
+                Err(quiche::h3::Error::Done) => return Ok(progressed),
+                Err(error) => return Err(io::Error::other(format!("h3 poll error: {error}"))),
+            }
+        }
+    }
+
+    fn poll_incoming_datagrams(&mut self) -> io::Result<bool> {
+        let mut progressed = false;
+
+        loop {
+            if self.inbound_queue.len() >= DEFAULT_QUEUE_CAPACITY {
+                return Ok(progressed);
+            }
+
+            match self.conn.dgram_recv_vec() {
+                Ok(dgram) => {
+                    progressed = true;
+                    if let Some(offset) = parse_datagram_offset(&dgram, 0) {
+                        let dgram = Bytes::from(dgram);
+                        let packet = dgram.slice(offset..);
+                        if packet::validate_incoming(packet.as_ref()).is_ok() {
+                            self.inbound_queue.push_back(packet);
+                        }
+                    }
+                }
+                Err(quiche::Error::Done) => return Ok(progressed),
+                Err(error) => {
+                    log::debug!("dgram recv error: {error}");
+                    return Ok(progressed);
+                }
             }
         }
     }
 }
 
-async fn emit_closed(
-    event_tx: &mpsc::Sender<PacketSessionEvent>,
-    state_tx: &watch::Sender<PacketSessionState>,
-    reason: PacketSessionCloseReason,
-) {
-    let _ = state_tx.send(PacketSessionState::Closed);
-    let _ = event_tx.send(PacketSessionEvent::Closed(reason)).await;
+impl Stream for MasquePacketStream {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if let Some(packet) = self.inbound_queue.pop_front() {
+                return Poll::Ready(Some(Ok(packet)));
+            }
+
+            if self.emitted_terminal_error {
+                return Poll::Ready(None);
+            }
+
+            if self.terminal_error.is_some() {
+                self.emitted_terminal_error = true;
+                return Poll::Ready(Some(Err(self.terminal_io_error())));
+            }
+
+            match self.poll_drive(cx) {
+                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Err(error)) => {
+                    self.set_terminal_error(error.to_string());
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
 }
 
-async fn run_packet_session_once(
-    config: &Config,
-    session_cfg: &PacketSessionConfig,
-    pending_packet: &mut Option<Bytes>,
-    packet_rx: &mut mpsc::Receiver<Bytes>,
-    event_tx: &mpsc::Sender<PacketSessionEvent>,
-    control_rx: &mut mpsc::Receiver<PacketSessionControl>,
-    state_tx: &watch::Sender<PacketSessionState>,
-) -> SessionLoopOutcome {
-    let tls_material = match tls::prepare_tls_material(config) {
-        Ok(material) => material,
-        Err(error) => {
-            return SessionLoopOutcome::Close(PacketSessionCloseReason::InternalError(format!(
-                "failed to prepare TLS material: {error:#}"
-            )));
+impl Sink<Bytes> for MasquePacketStream {
+    type Error = io::Error;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.state == PacketSessionState::Closed {
+            return Poll::Ready(Err(self.closed_io_error()));
         }
-    };
 
-    let mut quic_config = match build_quic_config(&tls_material) {
-        Ok(config) => config,
-        Err(error) => {
-            return SessionLoopOutcome::Close(PacketSessionCloseReason::InternalError(format!(
-                "failed to build quic config: {error:#}"
-            )));
+        if self.terminal_error.is_some() {
+            return Poll::Ready(Err(self.terminal_io_error()));
         }
-    };
 
-    let bind_addr: SocketAddr = session_cfg
-        .bind
-        .unwrap_or_else(|| match session_cfg.endpoint {
-            SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-            SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
-        });
-
-    let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
-        Ok(socket) => socket,
-        Err(error) => {
-            return SessionLoopOutcome::Reconnect(format!("bind failed: {error}"));
+        if self.outbound_queue.len() >= DEFAULT_QUEUE_CAPACITY {
+            match self.poll_drive(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => {
+                    self.set_terminal_error(error.to_string());
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
-    };
-    if let Err(error) = socket.connect(session_cfg.endpoint).await {
-        return SessionLoopOutcome::Reconnect(format!("connect failed: {error}"));
-    }
-    let local_addr = match socket.local_addr() {
-        Ok(addr) => addr,
-        Err(error) => {
-            return SessionLoopOutcome::Reconnect(format!("local_addr failed: {error}"));
-        }
-    };
 
-    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-    if ring::rand::SystemRandom::new().fill(&mut scid).is_err() {
-        return SessionLoopOutcome::Close(PacketSessionCloseReason::InternalError(
-            "RNG failure".to_string(),
-        ));
-    }
-    let scid = quiche::ConnectionId::from_ref(&scid);
-
-    let mut conn = match quiche::connect(
-        Some(&session_cfg.sni),
-        &scid,
-        local_addr,
-        session_cfg.endpoint,
-        &mut quic_config,
-    ) {
-        Ok(conn) => conn,
-        Err(error) => {
-            return SessionLoopOutcome::Reconnect(format!("quiche connect failed: {error}"));
-        }
-    };
-
-    let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
-    let mut buf = vec![0u8; 65535];
-
-    if let Err(error) = flush_conn_send(&socket, &mut conn, &mut out).await {
-        return SessionLoopOutcome::Reconnect(format!("initial send failed: {error}"));
-    }
-
-    let _ = state_tx.send(PacketSessionState::Connecting);
-    let handshake_outcome = complete_handshake(
-        &socket,
-        &mut conn,
-        &mut out,
-        &mut buf,
-        local_addr,
-        session_cfg.endpoint,
-        control_rx,
-        state_tx,
-    )
-    .await;
-    if let Some(outcome) = handshake_outcome {
-        return outcome;
-    }
-
-    if let Some(peer_cert) = conn.peer_cert() {
-        if !tls::verify_endpoint_key(peer_cert, &tls_material.endpoint_pub_key_spki_der) {
-            return SessionLoopOutcome::Reconnect(
-                "peer certificate public key does not match pinned endpoint key".to_string(),
-            );
+        if self.outbound_queue.len() < DEFAULT_QUEUE_CAPACITY {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
         }
     }
 
-    let mut h3_config = match quiche::h3::Config::new() {
-        Ok(config) => config,
-        Err(error) => {
-            return SessionLoopOutcome::Reconnect(format!("h3 config failed: {error}"));
+    fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> io::Result<()> {
+        if self.state == PacketSessionState::Closed {
+            return Err(self.closed_io_error());
         }
-    };
-    h3_config.enable_extended_connect(true);
 
-    let mut h3_conn = match quiche::h3::Connection::with_transport(&mut conn, &h3_config) {
-        Ok(conn) => conn,
-        Err(error) => {
-            return SessionLoopOutcome::Reconnect(format!("h3 connection failed: {error}"));
+        if self.terminal_error.is_some() {
+            return Err(self.terminal_io_error());
         }
-    };
 
-    let req = vec![
-        quiche::h3::Header::new(b":method", b"CONNECT"),
-        quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
-        quiche::h3::Header::new(b":scheme", b"https"),
-        quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
-        quiche::h3::Header::new(b":path", b"/"),
-        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-        quiche::h3::Header::new(b"user-agent", b""),
-    ];
-
-    let stream_id = match h3_conn.send_request(&mut conn, &req, false) {
-        Ok(id) => id,
-        Err(error) => {
-            return SessionLoopOutcome::Reconnect(format!("send CONNECT request failed: {error}"));
+        if self.outbound_queue.len() >= DEFAULT_QUEUE_CAPACITY {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "MASQUE outbound queue is full",
+            ));
         }
-    };
-    let flow_id = stream_id / 4;
 
-    if let Err(error) = flush_conn_send(&socket, &mut conn, &mut out).await {
-        return SessionLoopOutcome::Reconnect(format!("post CONNECT send failed: {error}"));
+        self.outbound_queue.push_back(item);
+        Ok(())
     }
 
-    let connect_outcome = wait_for_connect_response(
-        &socket,
-        &mut conn,
-        &mut h3_conn,
-        &mut out,
-        &mut buf,
-        local_addr,
-        session_cfg.endpoint,
-        stream_id,
-        control_rx,
-        state_tx,
-    )
-    .await;
-    if let Some(outcome) = connect_outcome {
-        return outcome;
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            if self.terminal_error.is_some() {
+                return Poll::Ready(Err(self.terminal_io_error()));
+            }
+
+            let queue_before = self.outbound_queue.len();
+            match self.poll_drive(cx) {
+                Poll::Ready(Ok(())) => {
+                    if self.outbound_queue.is_empty() {
+                        match self.poll_flush_conn_send(cx) {
+                            Poll::Ready(Ok(_)) => return Poll::Ready(Ok(())),
+                            Poll::Ready(Err(error)) => {
+                                self.set_terminal_error(error.to_string());
+                                return Poll::Ready(Err(error));
+                            }
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+
+                    if self.outbound_queue.len() == queue_before {
+                        return Poll::Pending;
+                    }
+                }
+                Poll::Ready(Err(error)) => {
+                    self.set_terminal_error(error.to_string());
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 
-    let _ = state_tx.send(PacketSessionState::Ready);
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.terminal_error.is_none() {
+            self.conn.close(true, 0, b"stream closed").ok();
+        }
 
-    let flow_prefix = build_flow_prefix(flow_id);
-    let mut queue = VecDeque::new();
-    if let Some(packet) = pending_packet.take() {
-        queue.push_back(packet);
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                self.state = PacketSessionState::Closed;
+                self.emitted_terminal_error = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => {
+                self.set_terminal_error(error.to_string());
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
-
-    run_connected_loop(
-        &socket,
-        &mut conn,
-        &mut h3_conn,
-        &flow_prefix,
-        &mut queue,
-        packet_rx,
-        event_tx,
-        control_rx,
-        &mut out,
-        &mut buf,
-        local_addr,
-        session_cfg,
-    )
-    .await
 }
 
 fn build_quic_config(tls_material: &tls::TlsMaterial) -> Result<quiche::Config> {
@@ -376,11 +586,7 @@ async fn complete_handshake(
     buf: &mut [u8],
     local_addr: SocketAddr,
     endpoint: SocketAddr,
-    control_rx: &mut mpsc::Receiver<PacketSessionControl>,
-    state_tx: &watch::Sender<PacketSessionState>,
 ) -> Option<SessionLoopOutcome> {
-    let _ = state_tx.send(PacketSessionState::Handshaking);
-
     loop {
         let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
 
@@ -392,11 +598,6 @@ async fn complete_handshake(
                         conn.recv(&mut buf[..len], recv_info).ok();
                     }
                     Err(error) => return Some(SessionLoopOutcome::Reconnect(format!("UDP recv during handshake failed: {error}"))),
-                }
-            }
-            maybe_control = control_rx.recv() => {
-                if matches!(maybe_control, Some(PacketSessionControl::Close)) {
-                    return Some(SessionLoopOutcome::Close(PacketSessionCloseReason::Requested));
                 }
             }
             () = tokio::time::sleep(timeout) => {
@@ -430,10 +631,7 @@ async fn wait_for_connect_response(
     local_addr: SocketAddr,
     endpoint: SocketAddr,
     stream_id: u64,
-    control_rx: &mut mpsc::Receiver<PacketSessionControl>,
-    state_tx: &watch::Sender<PacketSessionState>,
 ) -> Option<SessionLoopOutcome> {
-    let _ = state_tx.send(PacketSessionState::Handshaking);
     let mut connect_established = false;
 
     for _ in 0..100 {
@@ -447,11 +645,6 @@ async fn wait_for_connect_response(
                         conn.recv(&mut buf[..len], recv_info).ok();
                     }
                     Err(error) => return Some(SessionLoopOutcome::Reconnect(format!("UDP recv before CONNECT response failed: {error}"))),
-                }
-            }
-            maybe_control = control_rx.recv() => {
-                if matches!(maybe_control, Some(PacketSessionControl::Close)) {
-                    return Some(SessionLoopOutcome::Close(PacketSessionCloseReason::Requested));
                 }
             }
             () = tokio::time::sleep(timeout) => {
@@ -506,123 +699,6 @@ async fn wait_for_connect_response(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_connected_loop(
-    socket: &tokio::net::UdpSocket,
-    conn: &mut quiche::Connection,
-    h3_conn: &mut quiche::h3::Connection,
-    flow_prefix: &[u8],
-    queue: &mut VecDeque<Bytes>,
-    packet_rx: &mut mpsc::Receiver<Bytes>,
-    event_tx: &mpsc::Sender<PacketSessionEvent>,
-    control_rx: &mut mpsc::Receiver<PacketSessionControl>,
-    out: &mut [u8],
-    buf: &mut [u8],
-    local_addr: SocketAddr,
-    session_cfg: &PacketSessionConfig,
-) -> SessionLoopOutcome {
-    loop {
-        flush_pending_queue(conn, flow_prefix, queue);
-
-        let timeout = conn
-            .timeout()
-            .unwrap_or(session_cfg.keepalive_period)
-            .min(session_cfg.keepalive_period);
-
-        tokio::select! {
-            maybe_packet = packet_rx.recv() => {
-                match maybe_packet {
-                    Some(packet) => queue.push_back(packet),
-                    None => return SessionLoopOutcome::Close(PacketSessionCloseReason::InputClosed),
-                }
-            }
-            result = socket.recv(buf) => {
-                match result {
-                    Ok(len) => {
-                        let recv_info = quiche::RecvInfo { to: local_addr, from: session_cfg.endpoint };
-                        conn.recv(&mut buf[..len], recv_info).ok();
-                    }
-                    Err(error) => return SessionLoopOutcome::Reconnect(format!("UDP recv failed: {error}")),
-                }
-            }
-            maybe_control = control_rx.recv() => {
-                if matches!(maybe_control, Some(PacketSessionControl::Close)) {
-                    return SessionLoopOutcome::Close(PacketSessionCloseReason::Requested);
-                }
-            }
-            () = tokio::time::sleep(timeout) => {
-                conn.on_timeout();
-            }
-        }
-
-        flush_pending_queue(conn, flow_prefix, queue);
-
-        while let Ok(len) = socket.try_recv(buf) {
-            let recv_info = quiche::RecvInfo {
-                to: local_addr,
-                from: session_cfg.endpoint,
-            };
-            conn.recv(&mut buf[..len], recv_info).ok();
-        }
-
-        loop {
-            match h3_conn.poll(conn) {
-                Ok(_) => {}
-                Err(quiche::h3::Error::Done) => break,
-                Err(error) => {
-                    return SessionLoopOutcome::Reconnect(format!("h3 poll error: {error}"));
-                }
-            }
-        }
-
-        loop {
-            match conn.dgram_recv_vec() {
-                Ok(dgram) => {
-                    if let Some(offset) = parse_datagram_offset(&dgram, 0) {
-                        let dgram = Bytes::from(dgram);
-                        let packet = dgram.slice(offset..);
-                        if packet::validate_incoming(packet.as_ref()).is_ok() {
-                            match event_tx.try_send(PacketSessionEvent::Packet(packet)) {
-                                Ok(()) => {}
-                                Err(TrySendError::Full(PacketSessionEvent::Packet(packet))) => {
-                                    log::warn!(
-                                        "dropping incoming MASQUE packet because bridge event queue is full: {} bytes",
-                                        packet.len()
-                                    );
-                                }
-                                Err(TrySendError::Closed(PacketSessionEvent::Packet(_))) => {
-                                    return SessionLoopOutcome::Close(
-                                        PacketSessionCloseReason::OutputClosed,
-                                    );
-                                }
-                                Err(TrySendError::Full(_)) => {}
-                                Err(TrySendError::Closed(_)) => {
-                                    return SessionLoopOutcome::Close(
-                                        PacketSessionCloseReason::OutputClosed,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(quiche::Error::Done) => break,
-                Err(error) => {
-                    log::debug!("dgram recv error: {error}");
-                    break;
-                }
-            }
-        }
-
-        if let Err(error) = flush_conn_send(socket, conn, out).await {
-            return SessionLoopOutcome::Reconnect(format!("quic send error: {error}"));
-        }
-
-        if conn.is_closed() {
-            return SessionLoopOutcome::Reconnect("MASQUE connection closed".to_string());
-        }
-    }
-}
-
 async fn flush_conn_send(
     socket: &tokio::net::UdpSocket,
     conn: &mut quiche::Connection,
@@ -644,23 +720,34 @@ fn flush_pending_queue(
     conn: &mut quiche::Connection,
     flow_prefix: &[u8],
     queue: &mut VecDeque<Bytes>,
-) {
-    while let Some(packet) = queue.pop_front() {
+) -> bool {
+    let mut progressed = false;
+
+    while let Some(packet) = queue.front().cloned() {
         match build_flow_datagram(flow_prefix, packet) {
             Some(dgram) => match conn.dgram_send_vec(dgram) {
-                Ok(()) | Err(quiche::Error::InvalidState) => {}
+                Ok(()) | Err(quiche::Error::InvalidState) => {
+                    let _ = queue.pop_front();
+                    progressed = true;
+                }
                 Err(quiche::Error::Done) => {
                     break;
                 }
                 Err(error) => {
+                    let _ = queue.pop_front();
+                    progressed = true;
                     log::debug!("datagram send error: {error}");
                 }
             },
             None => {
+                let _ = queue.pop_front();
+                progressed = true;
                 log::trace!("dropping outgoing packet before MASQUE send");
             }
         }
     }
+
+    progressed
 }
 
 fn build_flow_datagram(flow_prefix: &[u8], packet: Bytes) -> Option<Vec<u8>> {

@@ -32,6 +32,7 @@ mod register;
 mod tls;
 mod tun_device;
 mod tunnel;
+mod udp_socket;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

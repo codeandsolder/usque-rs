@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::icmp;
 use crate::packet;
 use crate::tls;
+use crate::udp_socket::bind_udp_socket;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
@@ -169,7 +170,7 @@ where
         SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
     };
 
-    let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
+    let socket = bind_udp_socket(bind_addr, "masque-native-tunnel")?;
     socket.connect(tunnel_cfg.endpoint).await?;
     let local_addr = socket.local_addr()?;
 
