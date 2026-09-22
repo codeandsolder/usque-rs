@@ -121,5 +121,7 @@ jobs:
           files: |
             ${{ steps.pkg.outputs.archive }}
             ${{ steps.pkg.outputs.archive }}.sha256
-          generate_release_notes: true
+          # All matrix jobs upload to the same release. Generate notes in one
+          # job only or GitHub appends the same generated body once per target.
+          generate_release_notes: ${{ matrix.artifact_name == 'usque-rs-x86_64-linux-musl' }}
           fail_on_unmatched_files: true
