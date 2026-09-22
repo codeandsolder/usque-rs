@@ -36,8 +36,7 @@ p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 der = { version = "0.7", features = ["pem"] }
 pkcs8 = { version = "0.10", features = ["pem", "std"] }
 tun = { version = "0.7", features = ["async"] }
-rtnetlink = "0.14"
-netlink-packet-route = "0.21"
+rtnetlink = "0.23"
 futures = "0.3"
 tempfile = "3"
 time = "0.3"
