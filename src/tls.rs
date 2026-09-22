@@ -62,6 +62,62 @@ pub fn validate_config(config: &Config) -> Result<()> {
     prepare_tls_material(config).map(|_| ())
 }
 
+/// Build the shared QUIC configuration used by both the native TUN and
+/// reusable packet-stream paths.
+pub fn build_quic_config(
+    tls_material: &TlsMaterial,
+    max_datagram_size: usize,
+) -> Result<quiche::Config> {
+    let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)
+        .map_err(|error| anyhow::anyhow!("quiche config: {error}"))?;
+
+    // Endpoint identity is verified below the TLS stack by pinning the peer
+    // certificate SPKI to the key returned by WARP registration.
+    quic_config.verify_peer(false);
+    quic_config
+        .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+        .map_err(|error| anyhow::anyhow!("set ALPN: {error}"))?;
+
+    // Boring 5 enables hybrid post-quantum groups by default. This project
+    // intentionally keeps the smaller classical handshake used on
+    // resource-constrained routers; revisit this explicitly if PQC is added.
+    quic_config
+        .set_curves_list("X25519:P-256:P-384")
+        .map_err(|error| anyhow::anyhow!("set TLS curves: {error}"))?;
+
+    let cert_path = tls_material
+        .cert_pem_file
+        .path()
+        .to_str()
+        .context("temporary certificate path is not valid UTF-8")?;
+    let key_path = tls_material
+        .key_pem_file
+        .path()
+        .to_str()
+        .context("temporary private-key path is not valid UTF-8")?;
+
+    quic_config
+        .load_cert_chain_from_pem_file(cert_path)
+        .map_err(|error| anyhow::anyhow!("load cert: {error}"))?;
+    quic_config
+        .load_priv_key_from_pem_file(key_path)
+        .map_err(|error| anyhow::anyhow!("load key: {error}"))?;
+
+    quic_config.set_max_idle_timeout(0);
+    quic_config.set_max_recv_udp_payload_size(max_datagram_size);
+    quic_config.set_max_send_udp_payload_size(max_datagram_size);
+    quic_config.set_initial_max_data(10_000_000);
+    quic_config.set_initial_max_stream_data_bidi_local(1_000_000);
+    quic_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    quic_config.set_initial_max_stream_data_uni(1_000_000);
+    quic_config.set_initial_max_streams_bidi(100);
+    quic_config.set_initial_max_streams_uni(100);
+    quic_config.set_disable_active_migration(true);
+    quic_config.enable_dgram(true, 1000, 1000);
+
+    Ok(quic_config)
+}
+
 /// Verify a peer's DER certificate against the pinned SPKI public key.
 /// Returns true if the peer cert's `SubjectPublicKeyInfo` matches.
 pub fn verify_endpoint_key(peer_cert_der: &[u8], expected_spki_der: &[u8]) -> bool {

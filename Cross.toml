@@ -11,7 +11,10 @@ passthrough = [
 pre-build = [
     "apt-get update -qq",
     "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build perl pkg-config clang libclang-dev nasm curl ca-certificates xz-utils",
-    "curl -sSfL https://go.dev/dl/go1.22.10.linux-amd64.tar.gz | tar -xzf - -C /usr/local",
+    "curl -sSfL https://go.dev/dl/go1.22.10.linux-amd64.tar.gz -o /tmp/go1.22.10.linux-amd64.tar.gz",
+    "echo '736ce492a19d756a92719a6121226087ccd91b652ed5caec40ad6dbfb2252092  /tmp/go1.22.10.linux-amd64.tar.gz' | sha256sum -c -",
+    "tar -xzf /tmp/go1.22.10.linux-amd64.tar.gz -C /usr/local",
+    "rm /tmp/go1.22.10.linux-amd64.tar.gz",
     "ln -sf /usr/local/go/bin/go /usr/local/bin/go",
 ]
 

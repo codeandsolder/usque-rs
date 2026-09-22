@@ -162,7 +162,7 @@ async fn cmd_register(
     let (priv_key_der, pub_key_der) = register::generate_ec_keypair()?;
     let updated = register::enroll_key(&account_data, &pub_key_der, device_name.as_deref()).await?;
 
-    let cfg = config::Config::from_account_data(&updated, &account_data.token, &priv_key_der);
+    let cfg = config::Config::from_account_data(&updated, &account_data.token, &priv_key_der)?;
     cfg.save(config_path)?;
     log::info!("Config saved to {config_path}");
     Ok(())
@@ -181,6 +181,15 @@ async fn cmd_nativetun(
     no_iproute2: bool,
     interface_name: Option<String>,
 ) -> Result<()> {
+    if keepalive_period.is_zero() {
+        anyhow::bail!("keepalive period must be greater than zero");
+    }
+    if mtu != 1280 {
+        log::warn!(
+            "MTU {mtu} differs from the supported/default 1280; packet loss or PMTU issues may occur"
+        );
+    }
+
     let cfg = config::Config::load(config_path)?;
     eprintln!("Config loaded from {config_path}");
 

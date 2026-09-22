@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 
 use crate::register::AccountData;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     pub private_key: String,
     pub endpoint_v4: String,
@@ -21,23 +22,73 @@ pub struct Config {
 
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
+        let path = Path::new(path);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let metadata = fs::metadata(path)
+                .with_context(|| format!("failed to inspect config {}", path.display()))?;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(
+                    || format!("failed to secure config permissions for {}", path.display()),
+                )?;
+            }
+        }
+
         let data = fs::read_to_string(path)
-            .with_context(|| format!("failed to read config from {path}"))?;
+            .with_context(|| format!("failed to read config from {}", path.display()))?;
         serde_json::from_str(&data).with_context(|| "failed to parse config JSON")
     }
 
     pub fn save(&self, path: &str) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        if let Some(parent) = Path::new(path).parent() {
+        let path = Path::new(path);
+        if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
         }
-        fs::write(path, json).with_context(|| format!("failed to write config to {path}"))
+
+        let mut options = OpenOptions::new();
+        options.create(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let mut file = options
+            .open(path)
+            .with_context(|| format!("failed to open config {}", path.display()))?;
+
+        // OpenOptionsExt::mode only affects newly-created files. Tighten an existing config too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .with_context(|| {
+                    format!("failed to secure config permissions for {}", path.display())
+                })?;
+        }
+
+        file.set_len(0)
+            .with_context(|| format!("failed to truncate config {}", path.display()))?;
+        file.write_all(json.as_bytes())
+            .with_context(|| format!("failed to write config to {}", path.display()))
     }
 
-    pub fn from_account_data(account: &AccountData, token: &str, priv_key_der: &[u8]) -> Self {
-        let peer = &account.config.peers[0];
+    pub fn from_account_data(
+        account: &AccountData,
+        token: &str,
+        priv_key_der: &[u8],
+    ) -> Result<Self> {
+        let peer = account
+            .config
+            .peers
+            .first()
+            .context("registration response contained no WARP peers")?;
         let ep_v4 = peer.endpoint.v4.trim_end_matches(":0").to_string();
         let ep_v6 = peer.endpoint.v6.clone();
         let ep_v6 = ep_v6
@@ -46,7 +97,7 @@ impl Config {
             .trim_end_matches(":0")
             .to_string();
 
-        Self {
+        Ok(Self {
             private_key: base64::engine::general_purpose::STANDARD.encode(priv_key_der),
             endpoint_v4: ep_v4,
             endpoint_v6: ep_v6,
@@ -56,7 +107,7 @@ impl Config {
             access_token: token.to_string(),
             ipv4: account.config.interface.addresses.v4.clone(),
             ipv6: account.config.interface.addresses.v6.clone(),
-        }
+        })
     }
 
     pub fn get_ec_private_key_der(&self) -> Result<Vec<u8>> {
@@ -69,5 +120,136 @@ impl Config {
         let pem = pem::parse(&self.endpoint_pub_key)
             .with_context(|| "failed to parse endpoint public key PEM")?;
         Ok(pem.contents().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::register::{Account, Addresses, Endpoint, Interface, Peer, WarpConfig};
+
+    fn account_data(peers: Vec<Peer>) -> AccountData {
+        AccountData {
+            id: "device-id".to_string(),
+            token: "registration-token".to_string(),
+            account: Account {
+                id: "account-id".to_string(),
+                license: None,
+            },
+            config: WarpConfig {
+                peers,
+                interface: Interface {
+                    addresses: Addresses {
+                        v4: "172.16.0.2".to_string(),
+                        v6: "2606:4700:110::2".to_string(),
+                    },
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn from_account_data_rejects_missing_peer() {
+        let Err(error) = Config::from_account_data(&account_data(Vec::new()), "token", b"key")
+        else {
+            panic!("missing peer must be rejected");
+        };
+        assert!(
+            error.to_string().contains("no WARP peers"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("config.json");
+        let cfg = Config {
+            private_key: "secret-key".to_string(),
+            endpoint_v4: "192.0.2.1".to_string(),
+            endpoint_v6: "2001:db8::1".to_string(),
+            endpoint_pub_key: "public-key".to_string(),
+            license: String::new(),
+            id: "id".to_string(),
+            access_token: "secret-token".to_string(),
+            ipv4: "172.16.0.2".to_string(),
+            ipv6: "2606:4700:110::2".to_string(),
+        };
+
+        cfg.save(path.to_str().expect("UTF-8 temp path"))
+            .expect("save config");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("config metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("loosen permissions for regression test");
+        cfg.save(path.to_str().expect("UTF-8 temp path"))
+            .expect("resave config");
+        assert_eq!(
+            fs::metadata(path)
+                .expect("config metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_repairs_permissive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("config.json");
+        let cfg = Config {
+            private_key: "secret-key".to_string(),
+            endpoint_v4: "192.0.2.1".to_string(),
+            endpoint_v6: "2001:db8::1".to_string(),
+            endpoint_pub_key: "public-key".to_string(),
+            license: String::new(),
+            id: "id".to_string(),
+            access_token: "secret-token".to_string(),
+            ipv4: "172.16.0.2".to_string(),
+            ipv6: "2606:4700:110::2".to_string(),
+        };
+        fs::write(&path, serde_json::to_vec(&cfg).expect("serialize config"))
+            .expect("write config");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("make config permissive");
+
+        Config::load(path.to_str().expect("UTF-8 temp path")).expect("load config");
+        assert_eq!(
+            fs::metadata(path)
+                .expect("config metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn from_account_data_accepts_peer() {
+        let peer = Peer {
+            public_key: "public-key".to_string(),
+            endpoint: Endpoint {
+                v4: "192.0.2.1:0".to_string(),
+                v6: "[2001:db8::1]:0".to_string(),
+            },
+        };
+        let cfg = Config::from_account_data(&account_data(vec![peer]), "token", b"key")
+            .expect("valid account data");
+        assert_eq!(cfg.endpoint_v4, "192.0.2.1");
+        assert_eq!(cfg.endpoint_v6, "2001:db8::1");
     }
 }

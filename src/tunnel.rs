@@ -13,6 +13,7 @@ use crate::tls;
 use crate::udp_socket::bind_udp_socket;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 /// Configuration for a MASQUE tunnel session.
 pub struct TunnelConfig {
@@ -83,6 +84,10 @@ pub async fn maintain_tunnel(
     tunnel_cfg: &TunnelConfig,
     tun_dev: tun::Device,
 ) -> Result<()> {
+    if tunnel_cfg.keepalive_period.is_zero() {
+        bail!("keepalive period must be greater than zero");
+    }
+
     let async_dev = tun::AsyncDevice::new(tun_dev)
         .map_err(|e| anyhow::anyhow!("failed to create async TUN device: {e}"))?;
     let (mut tun_reader, mut tun_writer) = tokio::io::split(async_dev);
@@ -120,6 +125,7 @@ pub async fn maintain_tunnel(
             }
             Err(e) => {
                 eprintln!("\r\x1b[2K[error] {e:#}");
+                tokio::time::sleep(RECONNECT_DELAY).await;
             }
         }
         // Loop back to idle
@@ -139,41 +145,7 @@ where
 {
     let tls_material = tls::prepare_tls_material(config)?;
 
-    let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)
-        .map_err(|e| anyhow::anyhow!("quiche config: {e}"))?;
-
-    quic_config.verify_peer(false);
-    quic_config
-        .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
-        .map_err(|e| anyhow::anyhow!("set ALPN: {e}"))?;
-    let cert_path = tls_material
-        .cert_pem_file
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("temporary certificate path is not valid UTF-8"))?;
-    let key_path = tls_material
-        .key_pem_file
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("temporary private-key path is not valid UTF-8"))?;
-    quic_config
-        .load_cert_chain_from_pem_file(cert_path)
-        .map_err(|e| anyhow::anyhow!("load cert: {e}"))?;
-    quic_config
-        .load_priv_key_from_pem_file(key_path)
-        .map_err(|e| anyhow::anyhow!("load key: {e}"))?;
-
-    quic_config.set_max_idle_timeout(0);
-    quic_config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    quic_config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    quic_config.set_initial_max_data(10_000_000);
-    quic_config.set_initial_max_stream_data_bidi_local(1_000_000);
-    quic_config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    quic_config.set_initial_max_stream_data_uni(1_000_000);
-    quic_config.set_initial_max_streams_bidi(100);
-    quic_config.set_initial_max_streams_uni(100);
-    quic_config.set_disable_active_migration(true);
-    quic_config.enable_dgram(true, 1000, 1000);
+    let mut quic_config = tls::build_quic_config(&tls_material, MAX_DATAGRAM_SIZE)?;
 
     let bind_addr: SocketAddr = match tunnel_cfg.endpoint {
         SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
@@ -218,7 +190,9 @@ where
                     to: local_addr,
                     from: tunnel_cfg.endpoint,
                 };
-                conn.recv(&mut buf[..len], recv_info).ok();
+                if let Err(error) = conn.recv(&mut buf[..len], recv_info) {
+                log::debug!("dropping UDP packet rejected by QUIC: {error}");
+            }
             }
             () = tokio::time::sleep(timeout) => {
                 conn.on_timeout();
@@ -299,7 +273,9 @@ where
                     to: local_addr,
                     from: tunnel_cfg.endpoint,
                 };
-                conn.recv(&mut buf[..len], recv_info).ok();
+                if let Err(error) = conn.recv(&mut buf[..len], recv_info) {
+                log::debug!("dropping UDP packet rejected by QUIC: {error}");
+            }
             }
             () = tokio::time::sleep(timeout) => {
                 conn.on_timeout();
@@ -308,7 +284,7 @@ where
 
         loop {
             match h3_conn.poll(&mut conn) {
-                Ok((sid, quiche::h3::Event::Headers { list, has_body: _ })) if sid == stream_id => {
+                Ok((sid, quiche::h3::Event::Headers { list, .. })) if sid == stream_id => {
                     for h in &list {
                         if h.name() == b":status" {
                             let status = std::str::from_utf8(h.value()).unwrap_or("?");
@@ -397,7 +373,7 @@ where
             dgram.extend_from_slice(&flow_prefix);
             dgram.extend_from_slice(&pkt);
             let pkt_len = pkt.len() as u64;
-            if conn.dgram_send_vec(dgram).is_ok() {
+            if conn.dgram_send_buf(dgram).is_ok() {
                 stats.tx_packets.fetch_add(1, Ordering::Relaxed);
                 stats.tx_bytes.fetch_add(pkt_len, Ordering::Relaxed);
             }
@@ -409,13 +385,14 @@ where
     let mut tun_buf = vec![0u8; mtu + 128];
     let keepalive_interval = tunnel_cfg.keepalive_period;
 
-    let result: Result<()> = loop {
-        let timeout = conn
-            .timeout()
-            .unwrap_or(keepalive_interval)
-            .min(keepalive_interval);
+    let result: Result<()> = async {
+        loop {
+            let quic_timeout = conn.timeout();
+            let timeout = quic_timeout
+                .unwrap_or(keepalive_interval)
+                .min(keepalive_interval);
 
-        tokio::select! {
+            tokio::select! {
             // Read from TUN -> send to QUIC
             result = tokio::io::AsyncReadExt::read(tun_reader, &mut tun_buf) => {
                 let n = result?;
@@ -431,7 +408,7 @@ where
                         dgram.extend_from_slice(&flow_prefix);
                         dgram.extend_from_slice(pkt);
 
-                        match conn.dgram_send_vec(dgram) {
+                        match conn.dgram_send_buf(dgram) {
                             Ok(()) => {
                                 stats.tx_packets.fetch_add(1, Ordering::Relaxed);
                                 stats.tx_bytes.fetch_add(pkt_len, Ordering::Relaxed);
@@ -447,7 +424,9 @@ where
                                 stats.dropped.fetch_add(1, Ordering::Relaxed);
                                 log::debug!("datagram send error: {e}, generating ICMP");
                                 if let Some(icmp_pkt) = icmp::compose_icmp_too_large(&tun_buf[..n], 1280) {
-                                    tokio::io::AsyncWriteExt::write_all(tun_writer, &icmp_pkt).await.ok();
+                                    tokio::io::AsyncWriteExt::write_all(tun_writer, &icmp_pkt)
+                                        .await
+                                        .map_err(|error| anyhow::anyhow!("failed to write ICMP response to TUN: {error}"))?;
                                 }
                             }
                         }
@@ -471,9 +450,15 @@ where
                 }
             }
 
-            // Timeout handling
+            // QUIC loss-recovery timeout and idle keepalive share the wakeup.
             () = tokio::time::sleep(timeout) => {
-                conn.on_timeout();
+                if quic_timeout.is_some_and(|duration| duration <= keepalive_interval) {
+                    conn.on_timeout();
+                }
+                if quic_timeout.is_none_or(|duration| keepalive_interval <= duration) {
+                    conn.send_ack_eliciting()
+                        .map_err(|error| anyhow::anyhow!("failed to schedule QUIC keepalive: {error}"))?;
+                }
             }
         }
 
@@ -485,7 +470,9 @@ where
                 to: local_addr,
                 from: tunnel_cfg.endpoint,
             };
-            conn.recv(&mut buf[..len], recv_info).ok();
+            if let Err(error) = conn.recv(&mut buf[..len], recv_info) {
+                log::debug!("dropping UDP packet rejected by QUIC: {error}");
+            }
         }
 
         // Process H3 events (capsules, etc.)
@@ -502,7 +489,7 @@ where
 
         // Drain received datagrams -> TUN
         loop {
-            match conn.dgram_recv_vec() {
+            match conn.dgram_recv_buf() {
                 Ok(dgram) => {
                     if let Some(ip_payload) = parse_datagram(&dgram, flow_id) {
                         if packet::validate_incoming(ip_payload).is_ok() {
@@ -512,7 +499,7 @@ where
                                 .fetch_add(ip_payload.len() as u64, Ordering::Relaxed);
                             tokio::io::AsyncWriteExt::write_all(tun_writer, ip_payload)
                                 .await
-                                .ok();
+                                .map_err(|error| anyhow::anyhow!("failed to write inbound packet to TUN: {error}"))?;
                         }
                     }
                 }
@@ -548,12 +535,15 @@ where
             .quic_retrans
             .store(qs.retrans as u64, Ordering::Relaxed);
 
-        if conn.is_closed() {
-            break Ok(());
+            if conn.is_closed() {
+                break Ok(());
+            }
         }
-    };
+    }
+    .await;
 
     stats_handle.abort();
+    let _ = stats_handle.await;
     result
 }
 

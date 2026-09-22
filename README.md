@@ -22,7 +22,7 @@ Since my router is a literal **hot potato**, I wanted to get this working with z
 
 **usque-rs (Rust):**
 - Reconnects on-demand.
-- Tries to grow the packet size on the fly using protocol-supported PMTU discovery :tm:.
+- Uses a conservative 1280-byte TUN MTU by default with a 1350-byte QUIC UDP payload ceiling; automatic PMTU growth is not currently enabled.
 
 ## Is it PQC ready?
 
