@@ -405,7 +405,7 @@ jobs:
 
           - Read the official Rust ${VERSION} announcement and detailed release notes/changelog.
           - Review relevant language, standard-library, rustc, Cargo, Clippy, rustfmt, target/platform, and tooling changes.
-          - Review all Rust code, `Cargo.toml`/`Cargo.lock`, CI, Docker/build tooling, `SKILL.md`, README/docs, examples, lints, and project conventions for newly preferable patterns or obsolete workarounds.
+          - Review all Rust code, `Cargo.toml`/`Cargo.lock`, CI/release and cross-build tooling, README/setup docs, tests, lints, and project conventions for newly preferable patterns or obsolete workarounds.
           - Adopt useful newly-stable features and current best practices where they improve the project; remove workarounds that the new stable release makes unnecessary.
           - Update the current-stable CI/toolchain references while preserving the intentional MSRV contract unless there is a separately justified reason to raise it.
           - Run the full CI-equivalent test matrix and fix fallout.
