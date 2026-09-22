@@ -34,6 +34,8 @@ Still needs to be measured properly, but it is able to max out my 150 Mbit/s res
 
 ## Release binaries
 
+Building from source requires Rust 1.88 or newer.
+
 x86-64 releases are built at three ISA levels:
 
 - `usque-rs-x86_64-linux-musl`: portable baseline build.
