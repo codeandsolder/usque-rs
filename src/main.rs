@@ -26,9 +26,9 @@
 //! usque-rs - MASQUE (CONNECT-IP) client for Cloudflare WARP.
 
 use anyhow::Result;
-use usque_rs::{config, register, tun_device, tunnel};
 use clap::{Parser, Subcommand};
 use std::time::Duration;
+use usque_rs::{config, register, tun_device, tunnel};
 
 #[derive(Parser)]
 #[command(
