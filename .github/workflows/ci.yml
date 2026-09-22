@@ -17,6 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify maintenance detector syntax
+        run: python3 -m py_compile .github/scripts/*.py
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
