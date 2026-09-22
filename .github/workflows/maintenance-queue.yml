@@ -139,6 +139,21 @@ jobs:
 
           git reset --hard HEAD
 
+      - name: Clear stale dependency queues while candidate is quarantined
+        if: steps.manifest.outputs.quarantined == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for label in automation:dependency automation:lockfile; do
+            gh issue list --repo "$REPO" --state open --label "$label" --limit 200 --json number --jq '.[].number' |
+            while read -r number; do
+              [[ -n "$number" ]] && gh issue close "$number" --repo "$REPO" --reason completed --comment "Closed automatically: the currently resolved dependency candidate is inside the 72-hour quarantine, so this previously actionable candidate is stale."
+            done
+          done
+
       - name: Queue manifest dependency issues
         if: steps.manifest.outputs.failed != 'true' && steps.manifest.outputs.quarantined != 'true'
         env:
@@ -244,6 +259,19 @@ jobs:
             git diff --stat -- Cargo.lock > /tmp/lockfile-stat.txt
           fi
           git reset --hard HEAD
+
+      - name: Clear stale lockfile queue while candidate is quarantined
+        if: steps.lockfile.outputs.quarantined == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh issue list --repo "$REPO" --state open --label "automation:lockfile" --limit 100 --json number --jq '.[].number' |
+          while read -r number; do
+            [[ -n "$number" ]] && gh issue close "$number" --repo "$REPO" --reason completed --comment "Closed automatically: the newly resolved lockfile candidate is inside the 72-hour quarantine, so this previously actionable candidate is stale."
+          done
 
       - name: Queue or close lockfile refresh issue
         if: steps.manifest.outputs.failed != 'true' && steps.lockfile.outputs.failed != 'true' && steps.lockfile.outputs.quarantined != 'true'
