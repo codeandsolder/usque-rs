@@ -55,8 +55,11 @@ pub async fn configure_tun(cfg: &TunConfig, dev: &tun::Device) -> Result<()> {
 
     handle
         .link()
-        .set(link_index)
-        .mtu(cfg.mtu)
+        .set(
+            rtnetlink::LinkUnspec::new_with_index(link_index)
+                .mtu(cfg.mtu)
+                .build(),
+        )
         .execute()
         .await
         .context("failed to set MTU")?;
@@ -86,8 +89,11 @@ pub async fn configure_tun(cfg: &TunConfig, dev: &tun::Device) -> Result<()> {
 
     handle
         .link()
-        .set(link_index)
-        .up()
+        .set(
+            rtnetlink::LinkUnspec::new_with_index(link_index)
+                .up()
+                .build(),
+        )
         .execute()
         .await
         .context("failed to bring link up")?;

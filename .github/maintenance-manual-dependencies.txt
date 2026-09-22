@@ -1,2 +1,0 @@
-# Dependencies whose latest incompatible release cannot be resolved by generic cargo-upgrade.
-# They are still checked against crates.io daily and queued separately once >=72 hours old.
