@@ -112,7 +112,9 @@ jobs:
               continue
             fi
 
-            body="<!-- ${marker} -->
+            export marker crate current latest created reason
+            body="$(python3 .github/scripts/render-maintenance-template.py <<'EOF'
+          <!-- ${marker} -->
           <!-- automation-queue:dependency -->
 
           `${crate}` needs a manual incompatible migration: locked `${current}` → exact detector-approved candidate `${latest}`.
@@ -121,7 +123,9 @@ jobs:
 
           crates.io publication time: `${created}`; the detector verified the candidate is at least 72 hours old.
 
-          Migrate this dependency deliberately, including feature/API changes, remove it from `.github/maintenance-manual-dependencies.txt` once generic resolution is safe again, refresh `Cargo.lock`, and run the full CI/release matrix. Do not substitute a newer release than `${latest}`."
+          Migrate this dependency deliberately, including feature/API changes, remove it from `.github/maintenance-manual-dependencies.txt` once generic resolution is safe again, refresh `Cargo.lock`, and run the full CI/release matrix. Do not substitute a newer release than `${latest}`.
+          EOF
+          )"
 
             if [[ -n "$existing" ]]; then
               gh issue edit "$existing" --repo "$REPO" --title "deps: manually migrate ${crate} to ${latest}" --body "$body"
