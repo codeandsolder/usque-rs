@@ -35,13 +35,127 @@ jobs:
           rustup default stable
           cargo install cargo-edit --version 0.13.13 --locked --no-default-features --features upgrade
 
+      - name: Queue resolver-blocking manual dependency migrations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY' >/tmp/manual-dependency-candidates.json
+          import datetime as dt
+          import json
+          import tomllib
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=72)
+          lock = tomllib.loads(Path("Cargo.lock").read_text())
+          locked = {
+              p["name"]: p["version"]
+              for p in lock.get("package", [])
+              if (p.get("source") or "").startswith("registry+")
+          }
+
+          items = []
+          for raw in Path(".github/maintenance-manual-dependencies.txt").read_text().splitlines():
+              line = raw.strip()
+              if not line or line.startswith("#"):
+                  continue
+              left, _, reason = line.partition("#")
+              crate = left.strip()
+              current = locked.get(crate)
+              if not current:
+                  continue
+
+              req = urllib.request.Request(
+                  "https://crates.io/api/v1/crates/" + urllib.parse.quote(crate, safe=""),
+                  headers={"Accept": "application/json", "User-Agent": "codeandsolder-maintenance-detector/1.0"},
+              )
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  payload = json.load(response)
+
+              latest = payload["crate"].get("max_stable_version")
+              version = next((v for v in payload.get("versions", []) if v["num"] == latest), None)
+              if not latest or not version or latest == current:
+                  continue
+              created = dt.datetime.fromisoformat(version["created_at"].replace("Z", "+00:00"))
+              items.append({
+                  "crate": crate,
+                  "current": current,
+                  "latest": latest,
+                  "created_at": created.isoformat(),
+                  "eligible": created <= cutoff,
+                  "reason": reason.strip(),
+              })
+
+          print(json.dumps(items))
+          PY
+
+          mapfile -t configured < <(sed -E 's/[[:space:]]*#.*$//' .github/maintenance-manual-dependencies.txt | awk 'NF {print $1}')
+          while IFS= read -r item; do
+            crate="$(jq -r '.crate' <<<"$item")"
+            current="$(jq -r '.current' <<<"$item")"
+            latest="$(jq -r '.latest' <<<"$item")"
+            created="$(jq -r '.created_at' <<<"$item")"
+            eligible="$(jq -r '.eligible' <<<"$item")"
+            reason="$(jq -r '.reason' <<<"$item")"
+            marker="automation-manual-dependency-${crate}"
+            existing="$(gh issue list --repo "$REPO" --state open --label "automation:dependency" --limit 200 --search "${marker} in:body" --json number --jq '.[0].number // empty')"
+
+            if [[ "$eligible" != "true" ]]; then
+              if [[ -n "$existing" ]]; then
+                gh issue close "$existing" --repo "$REPO" --reason completed --comment "Closed automatically: the currently selected manual migration candidate has not yet satisfied the 72-hour release quarantine."
+              fi
+              echo "${crate} ${latest} is still inside the 72-hour release quarantine (published ${created})."
+              continue
+            fi
+
+            body="<!-- ${marker} -->
+          <!-- automation-queue:dependency -->
+
+          `${crate}` needs a manual incompatible migration: locked `${current}` → exact detector-approved candidate `${latest}`.
+
+          The generic `cargo upgrade --incompatible` path excludes this crate because: ${reason}
+
+          crates.io publication time: `${created}`; the detector verified the candidate is at least 72 hours old.
+
+          Migrate this dependency deliberately, including feature/API changes, remove it from `.github/maintenance-manual-dependencies.txt` once generic resolution is safe again, refresh `Cargo.lock`, and run the full CI/release matrix. Do not substitute a newer release than `${latest}`."
+
+            if [[ -n "$existing" ]]; then
+              gh issue edit "$existing" --repo "$REPO" --title "deps: manually migrate ${crate} to ${latest}" --body "$body"
+            else
+              gh issue create --repo "$REPO" --title "deps: manually migrate ${crate} to ${latest}" --label "automation:dependency" --body "$body"
+            fi
+          done < <(jq -c '.[]' /tmp/manual-dependency-candidates.json)
+
+          # Close stale generated manual-migration issues whose crate is no longer
+          # configured as a resolver blocker or is already current.
+          gh issue list --repo "$REPO" --state open --label "automation:dependency" --limit 200 --json number,body --jq '.[] | @base64' |
+          while IFS= read -r encoded; do
+            issue="$(base64 -d <<<"$encoded")"
+            number="$(jq -r '.number' <<<"$issue")"
+            body="$(jq -r '.body' <<<"$issue")"
+            crate="$(sed -n 's/.*<!-- automation-manual-dependency-\([^ ]*\) -->.*/\1/p' <<<"$body" | head -n1)"
+            [[ -n "$crate" ]] || continue
+            if ! jq -e --arg crate "$crate" 'any(.[]; .crate == $crate)' /tmp/manual-dependency-candidates.json >/dev/null; then
+              gh issue close "$number" --repo "$REPO" --reason completed --comment "Closed automatically: this dependency is no longer a pending manual migration candidate."
+            fi
+          done
+
       - name: Detect manifest dependency upgrades
         id: manifest
         shell: bash
         run: |
           set -euo pipefail
 
-          if ! cargo upgrade --incompatible allow --pinned allow > /tmp/cargo-upgrade.log 2>&1 ||
+          manual_excludes=()
+          while read -r dep; do
+            [[ -n "$dep" ]] && manual_excludes+=(--exclude "$dep")
+          done < <(sed -E 's/[[:space:]]*#.*$//' .github/maintenance-manual-dependencies.txt | awk 'NF {print $1}')
+
+          if ! cargo upgrade --incompatible allow --pinned allow "${manual_excludes[@]}" > /tmp/cargo-upgrade.log 2>&1 ||
              ! cargo update >> /tmp/cargo-upgrade.log 2>&1; then
             cat /tmp/cargo-upgrade.log
             echo "failed=true" >> "$GITHUB_OUTPUT"
@@ -52,7 +166,7 @@ jobs:
           if (( ${#quarantined[@]} )); then
             printf 'Quarantining fresh direct dependencies: %s\\n' "${quarantined[*]}"
             git reset --hard HEAD
-            exclude_args=()
+            exclude_args=("${manual_excludes[@]}")
             for dep in "${quarantined[@]}"; do
               exclude_args+=(--exclude "$dep")
             done
@@ -205,6 +319,20 @@ jobs:
             fi
           done
 
+      - name: Clear recovered cargo-upgrade detector error
+        if: steps.manifest.outputs.failed != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          marker="automation-maintenance-error-cargo-upgrade"
+          gh issue list --repo "$REPO" --state open --label "automation:maintenance-error" --limit 50 --search "${marker} in:body" --json number --jq '.[].number' |
+          while read -r number; do
+            [[ -n "$number" ]] && gh issue close "$number" --repo "$REPO" --reason completed --comment "Closed automatically: cargo-upgrade detector recovered."
+          done
+
       - name: Report cargo-upgrade detector failure
         if: steps.manifest.outputs.failed == 'true'
         env:
@@ -314,6 +442,20 @@ jobs:
           elif [[ -n "$existing" ]]; then
             gh issue close "$existing" --repo "$REPO" --reason completed --comment 'Closed automatically: `cargo update` no longer changes Cargo.lock.'
           fi
+
+      - name: Clear recovered cargo-update detector error
+        if: steps.lockfile.outputs.failed != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          marker="automation-maintenance-error-cargo-update"
+          gh issue list --repo "$REPO" --state open --label "automation:maintenance-error" --limit 50 --search "${marker} in:body" --json number --jq '.[].number' |
+          while read -r number; do
+            [[ -n "$number" ]] && gh issue close "$number" --repo "$REPO" --reason completed --comment "Closed automatically: cargo-update detector recovered."
+          done
 
       - name: Report cargo-update detector failure
         if: steps.lockfile.outputs.failed == 'true'
