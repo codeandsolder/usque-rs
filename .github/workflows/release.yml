@@ -82,7 +82,7 @@ jobs:
       - name: Build (release)
         env:
           CARGO_PROFILE_RELEASE_PANIC: ${{ matrix.panic_strategy || 'abort' }}
-          RUSTFLAGS: ${{ matrix.rustflags || '' }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: ${{ matrix.rustflags || '' }}
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Strip binary
