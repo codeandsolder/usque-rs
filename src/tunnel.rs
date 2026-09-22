@@ -146,11 +146,21 @@ where
     quic_config
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .map_err(|e| anyhow::anyhow!("set ALPN: {e}"))?;
+    let cert_path = tls_material
+        .cert_pem_file
+        .path()
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("temporary certificate path is not valid UTF-8"))?;
+    let key_path = tls_material
+        .key_pem_file
+        .path()
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("temporary private-key path is not valid UTF-8"))?;
     quic_config
-        .load_cert_chain_from_pem_file(tls_material.cert_pem_file.path().to_str().unwrap())
+        .load_cert_chain_from_pem_file(cert_path)
         .map_err(|e| anyhow::anyhow!("load cert: {e}"))?;
     quic_config
-        .load_priv_key_from_pem_file(tls_material.key_pem_file.path().to_str().unwrap())
+        .load_priv_key_from_pem_file(key_path)
         .map_err(|e| anyhow::anyhow!("load key: {e}"))?;
 
     quic_config.set_max_idle_timeout(0);
@@ -233,15 +243,14 @@ where
         }
     }
 
-    // Verify endpoint key pinning
-    if let Some(peer_cert) = conn.peer_cert() {
-        if !tls::verify_endpoint_key(peer_cert, &tls_material.endpoint_pub_key_spki_der) {
-            bail!("peer certificate public key does not match pinned endpoint key");
-        }
-        log::debug!("Endpoint key pinning verified");
-    } else {
-        log::warn!("No peer certificate received; skipping key pinning");
+    // Verify endpoint key pinning.
+    let peer_cert = conn
+        .peer_cert()
+        .ok_or_else(|| anyhow::anyhow!("peer did not provide a certificate"))?;
+    if !tls::verify_endpoint_key(peer_cert, &tls_material.endpoint_pub_key_spki_der) {
+        bail!("peer certificate public key does not match pinned endpoint key");
     }
+    log::debug!("Endpoint key pinning verified");
 
     // Set up HTTP/3
     let mut h3_config = quiche::h3::Config::new().map_err(|e| anyhow::anyhow!("h3 config: {e}"))?;
