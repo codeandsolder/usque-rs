@@ -19,7 +19,7 @@ use crate::tls;
 use crate::udp_socket::bind_udp_socket;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-const DEFAULT_QUEUE_CAPACITY: usize = 32768;
+const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct PacketSessionConfig {
@@ -65,6 +65,7 @@ pub struct MasquePacketStream {
     local_addr: SocketAddr,
     endpoint: SocketAddr,
     keepalive_period: Duration,
+    mtu: usize,
     state: PacketSessionState,
     timeout: Pin<Box<Sleep>>,
     pending_send: Option<PendingUdpSend>,
@@ -126,10 +127,11 @@ impl MasquePacketStream {
             return Err(anyhow::anyhow!(outcome.into_message()));
         }
 
-        if let Some(peer_cert) = conn.peer_cert() {
-            if !tls::verify_endpoint_key(peer_cert, &tls_material.endpoint_pub_key_spki_der) {
-                bail!("peer certificate public key does not match pinned endpoint key");
-            }
+        let peer_cert = conn
+            .peer_cert()
+            .ok_or_else(|| anyhow::anyhow!("peer did not provide a certificate"))?;
+        if !tls::verify_endpoint_key(peer_cert, &tls_material.endpoint_pub_key_spki_der) {
+            bail!("peer certificate public key does not match pinned endpoint key");
         }
 
         let mut h3_config = quiche::h3::Config::new()?;
@@ -179,6 +181,7 @@ impl MasquePacketStream {
             local_addr,
             endpoint: session_cfg.endpoint,
             keepalive_period: session_cfg.keepalive_period,
+            mtu: session_cfg.mtu as usize,
             state: PacketSessionState::Ready,
             timeout: Box::pin(tokio::time::sleep(Duration::from_millis(0))),
             pending_send: None,
@@ -235,7 +238,7 @@ impl MasquePacketStream {
             let mut made_progress = false;
 
             made_progress |=
-                flush_pending_queue(&mut self.conn, &self.flow_prefix, &mut self.outbound_queue);
+                flush_pending_queue(&mut self.conn, &self.flow_prefix, &mut self.outbound_queue)?;
             match self.poll_flush_conn_send(cx) {
                 Poll::Ready(Ok(flushed)) => made_progress |= flushed,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -485,6 +488,17 @@ impl Sink<Bytes> for MasquePacketStream {
             return Err(self.terminal_io_error());
         }
 
+        if item.len() > self.mtu {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "packet size {} exceeds configured MTU {}",
+                    item.len(),
+                    self.mtu
+                ),
+            ));
+        }
+
         if self.outbound_queue.len() >= DEFAULT_QUEUE_CAPACITY {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -530,13 +544,30 @@ impl Sink<Bytes> for MasquePacketStream {
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.terminal_error.is_none() {
-            self.conn.close(true, 0, b"stream closed").ok();
+        if self.terminal_error.is_some() {
+            return Poll::Ready(Err(self.terminal_io_error()));
         }
 
-        match self.as_mut().poll_flush(cx) {
-            Poll::Ready(Ok(())) => {
-                self.state = PacketSessionState::Closed;
+        if self.state != PacketSessionState::Closed {
+            match self.as_mut().poll_flush(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => {
+                    self.set_terminal_error(error.to_string());
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+
+            if let Err(error) = self.conn.close(true, 0, b"stream closed") {
+                let error = io::Error::other(error.to_string());
+                self.set_terminal_error(error.to_string());
+                return Poll::Ready(Err(error));
+            }
+            self.state = PacketSessionState::Closed;
+        }
+
+        match self.poll_flush_conn_send(cx) {
+            Poll::Ready(Ok(_)) => {
                 self.emitted_terminal_error = true;
                 Poll::Ready(Ok(()))
             }
@@ -557,11 +588,21 @@ fn build_quic_config(tls_material: &tls::TlsMaterial) -> Result<quiche::Config> 
     quic_config
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .map_err(|e| anyhow::anyhow!("set ALPN: {e}"))?;
+    let cert_path = tls_material
+        .cert_pem_file
+        .path()
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("temporary certificate path is not valid UTF-8"))?;
+    let key_path = tls_material
+        .key_pem_file
+        .path()
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("temporary private-key path is not valid UTF-8"))?;
     quic_config
-        .load_cert_chain_from_pem_file(tls_material.cert_pem_file.path().to_str().unwrap())
+        .load_cert_chain_from_pem_file(cert_path)
         .map_err(|e| anyhow::anyhow!("load cert: {e}"))?;
     quic_config
-        .load_priv_key_from_pem_file(tls_material.key_pem_file.path().to_str().unwrap())
+        .load_priv_key_from_pem_file(key_path)
         .map_err(|e| anyhow::anyhow!("load key: {e}"))?;
 
     quic_config.set_max_idle_timeout(0);
@@ -720,40 +761,36 @@ fn flush_pending_queue(
     conn: &mut quiche::Connection,
     flow_prefix: &[u8],
     queue: &mut VecDeque<Bytes>,
-) -> bool {
+) -> io::Result<bool> {
     let mut progressed = false;
 
-    while let Some(packet) = queue.front().cloned() {
-        match build_flow_datagram(flow_prefix, packet) {
-            Some(dgram) => match conn.dgram_send_vec(dgram) {
-                Ok(()) | Err(quiche::Error::InvalidState) => {
-                    let _ = queue.pop_front();
-                    progressed = true;
-                }
-                Err(quiche::Error::Done) => {
-                    break;
-                }
-                Err(error) => {
-                    let _ = queue.pop_front();
-                    progressed = true;
-                    log::debug!("datagram send error: {error}");
-                }
-            },
-            None => {
+    while let Some(packet) = queue.front() {
+        let Some(dgram) = build_flow_datagram(flow_prefix, packet) else {
+            let _ = queue.pop_front();
+            progressed = true;
+            log::trace!("dropping outgoing packet before MASQUE send");
+            continue;
+        };
+
+        match conn.dgram_send_vec(dgram) {
+            Ok(()) => {
                 let _ = queue.pop_front();
                 progressed = true;
-                log::trace!("dropping outgoing packet before MASQUE send");
+            }
+            Err(quiche::Error::Done) => break,
+            Err(error) => {
+                return Err(io::Error::other(format!("datagram send failed: {error}")));
             }
         }
     }
 
-    progressed
+    Ok(progressed)
 }
 
-fn build_flow_datagram(flow_prefix: &[u8], packet: Bytes) -> Option<Vec<u8>> {
+fn build_flow_datagram(flow_prefix: &[u8], packet: &[u8]) -> Option<Vec<u8>> {
     let mut dgram = Vec::with_capacity(flow_prefix.len() + packet.len());
     dgram.extend_from_slice(flow_prefix);
-    dgram.extend_from_slice(&packet);
+    dgram.extend_from_slice(packet);
     if packet::prepare_outgoing(&mut dgram[flow_prefix.len()..]).is_ok() {
         Some(dgram)
     } else {
