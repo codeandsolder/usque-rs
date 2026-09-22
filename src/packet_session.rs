@@ -45,6 +45,13 @@ enum SessionLoopOutcome {
     Reconnect(String),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SessionTimerKind {
+    Quic,
+    Keepalive,
+    Both,
+}
+
 impl SessionLoopOutcome {
     fn into_message(self) -> String {
         match self {
@@ -68,6 +75,7 @@ pub struct MasquePacketStream {
     mtu: usize,
     state: PacketSessionState,
     timeout: Pin<Box<Sleep>>,
+    timer_kind: SessionTimerKind,
     pending_send: Option<PendingUdpSend>,
     terminal_error: Option<String>,
     emitted_terminal_error: bool,
@@ -80,8 +88,12 @@ struct PendingUdpSend {
 
 impl MasquePacketStream {
     pub async fn connect(config: Arc<Config>, session_cfg: PacketSessionConfig) -> Result<Self> {
+        if session_cfg.keepalive_period.is_zero() {
+            bail!("keepalive period must be greater than zero");
+        }
+
         let tls_material = tls::prepare_tls_material(config.as_ref())?;
-        let mut quic_config = build_quic_config(&tls_material)?;
+        let mut quic_config = tls::build_quic_config(&tls_material, MAX_DATAGRAM_SIZE)?;
 
         let bind_addr: SocketAddr =
             session_cfg
@@ -184,6 +196,7 @@ impl MasquePacketStream {
             mtu: session_cfg.mtu as usize,
             state: PacketSessionState::Ready,
             timeout: Box::pin(tokio::time::sleep(Duration::from_millis(0))),
+            timer_kind: SessionTimerKind::Keepalive,
             pending_send: None,
             terminal_error: None,
             emitted_terminal_error: false,
@@ -201,15 +214,16 @@ impl MasquePacketStream {
     }
 
     fn reset_timeout(&mut self) {
-        let deadline = Instant::now() + self.current_timeout();
-        self.timeout.as_mut().reset(deadline);
-    }
-
-    fn current_timeout(&self) -> Duration {
-        self.conn
-            .timeout()
-            .unwrap_or(self.keepalive_period)
-            .min(self.keepalive_period)
+        let (delay, kind) = match self.conn.timeout() {
+            Some(quic_timeout) => match quic_timeout.cmp(&self.keepalive_period) {
+                std::cmp::Ordering::Less => (quic_timeout, SessionTimerKind::Quic),
+                std::cmp::Ordering::Equal => (quic_timeout, SessionTimerKind::Both),
+                std::cmp::Ordering::Greater => (self.keepalive_period, SessionTimerKind::Keepalive),
+            },
+            None => (self.keepalive_period, SessionTimerKind::Keepalive),
+        };
+        self.timer_kind = kind;
+        self.timeout.as_mut().reset(Instant::now() + delay);
     }
 
     fn set_terminal_error(&mut self, error: impl Into<String>) {
@@ -255,7 +269,19 @@ impl MasquePacketStream {
             made_progress |= self.poll_incoming_datagrams()?;
 
             if self.timeout.as_mut().poll(cx).is_ready() {
-                self.conn.on_timeout();
+                match self.timer_kind {
+                    SessionTimerKind::Quic => self.conn.on_timeout(),
+                    SessionTimerKind::Keepalive => self
+                        .conn
+                        .send_ack_eliciting()
+                        .map_err(|error| io::Error::other(error.to_string()))?,
+                    SessionTimerKind::Both => {
+                        self.conn.on_timeout();
+                        self.conn
+                            .send_ack_eliciting()
+                            .map_err(|error| io::Error::other(error.to_string()))?;
+                    }
+                }
                 self.reset_timeout();
                 made_progress = true;
             }
@@ -399,7 +425,7 @@ impl MasquePacketStream {
                 return Ok(progressed);
             }
 
-            match self.conn.dgram_recv_vec() {
+            match self.conn.dgram_recv_buf() {
                 Ok(dgram) => {
                     progressed = true;
                     if let Some(offset) = parse_datagram_offset(&dgram, 0) {
@@ -580,46 +606,6 @@ impl Sink<Bytes> for MasquePacketStream {
     }
 }
 
-fn build_quic_config(tls_material: &tls::TlsMaterial) -> Result<quiche::Config> {
-    let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)
-        .map_err(|e| anyhow::anyhow!("quiche config: {e}"))?;
-
-    quic_config.verify_peer(false);
-    quic_config
-        .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
-        .map_err(|e| anyhow::anyhow!("set ALPN: {e}"))?;
-    let cert_path = tls_material
-        .cert_pem_file
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("temporary certificate path is not valid UTF-8"))?;
-    let key_path = tls_material
-        .key_pem_file
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("temporary private-key path is not valid UTF-8"))?;
-    quic_config
-        .load_cert_chain_from_pem_file(cert_path)
-        .map_err(|e| anyhow::anyhow!("load cert: {e}"))?;
-    quic_config
-        .load_priv_key_from_pem_file(key_path)
-        .map_err(|e| anyhow::anyhow!("load key: {e}"))?;
-
-    quic_config.set_max_idle_timeout(0);
-    quic_config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    quic_config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    quic_config.set_initial_max_data(10_000_000);
-    quic_config.set_initial_max_stream_data_bidi_local(1_000_000);
-    quic_config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    quic_config.set_initial_max_stream_data_uni(1_000_000);
-    quic_config.set_initial_max_streams_bidi(100);
-    quic_config.set_initial_max_streams_uni(100);
-    quic_config.set_disable_active_migration(true);
-    quic_config.enable_dgram(true, 1000, 1000);
-
-    Ok(quic_config)
-}
-
 async fn complete_handshake(
     socket: &tokio::net::UdpSocket,
     conn: &mut quiche::Connection,
@@ -636,7 +622,9 @@ async fn complete_handshake(
                 match result {
                     Ok(len) => {
                         let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
-                        conn.recv(&mut buf[..len], recv_info).ok();
+                        if let Err(error) = conn.recv(&mut buf[..len], recv_info) {
+                            log::debug!("dropping UDP packet rejected by QUIC: {error}");
+                        }
                     }
                     Err(error) => return Some(SessionLoopOutcome::Reconnect(format!("UDP recv during handshake failed: {error}"))),
                 }
@@ -683,7 +671,9 @@ async fn wait_for_connect_response(
                 match result {
                     Ok(len) => {
                         let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
-                        conn.recv(&mut buf[..len], recv_info).ok();
+                        if let Err(error) = conn.recv(&mut buf[..len], recv_info) {
+                            log::debug!("dropping UDP packet rejected by QUIC: {error}");
+                        }
                     }
                     Err(error) => return Some(SessionLoopOutcome::Reconnect(format!("UDP recv before CONNECT response failed: {error}"))),
                 }
@@ -695,7 +685,7 @@ async fn wait_for_connect_response(
 
         loop {
             match h3_conn.poll(conn) {
-                Ok((sid, quiche::h3::Event::Headers { list, has_body: _ })) if sid == stream_id => {
+                Ok((sid, quiche::h3::Event::Headers { list, .. })) if sid == stream_id => {
                     for header in &list {
                         if header.name() == b":status" {
                             let status = std::str::from_utf8(header.value()).unwrap_or("?");
@@ -772,7 +762,7 @@ fn flush_pending_queue(
             continue;
         };
 
-        match conn.dgram_send_vec(dgram) {
+        match conn.dgram_send_buf(dgram) {
             Ok(()) => {
                 let _ = queue.pop_front();
                 progressed = true;

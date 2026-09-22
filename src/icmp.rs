@@ -25,8 +25,13 @@ fn compose_icmpv4_too_large(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
         return None;
     }
 
-    // ICMP payload: original IP header + first 8 bytes of original payload
-    let icmp_payload_len = (IPV4_HEADER_LEN + 8).min(original.len());
+    let original_header_len = usize::from(original[0] & 0x0F) * 4;
+    if original_header_len < IPV4_HEADER_LEN || original_header_len > original.len() {
+        return None;
+    }
+
+    // ICMP payload: original IP header (including options) + first 8 payload bytes.
+    let icmp_payload_len = (original_header_len + 8).min(original.len());
     let icmp_data = &original[..icmp_payload_len];
 
     let total_len = IPV4_HEADER_LEN + ICMP_HEADER_LEN + icmp_data.len();
@@ -348,5 +353,22 @@ mod tests {
             icmp_sum = (icmp_sum & 0xFFFF) + (icmp_sum >> 16);
         }
         assert_eq!(icmp_sum as u16, 0xFFFF, "ICMP checksum should validate");
+    }
+    #[test]
+    fn ipv4_too_large_preserves_quoted_options() {
+        let mut original = make_ipv4_packet(36, [192, 0, 2, 1], [198, 51, 100, 2]);
+        original[0] = 0x46;
+        original[20..24].copy_from_slice(&[1, 1, 1, 0]);
+        let response = compose_icmp_too_large(&original, 1280).expect("ICMP response");
+        let quoted = &response[IPV4_HEADER_LEN + ICMP_HEADER_LEN..];
+        assert_eq!(quoted.len(), 32);
+        assert_eq!(&quoted[..24], &original[..24]);
+    }
+
+    #[test]
+    fn ipv4_too_large_rejects_invalid_ihl() {
+        let mut original = make_ipv4_packet(20, [192, 0, 2, 1], [198, 51, 100, 2]);
+        original[0] = 0x46;
+        assert!(compose_icmp_too_large(&original, 1280).is_none());
     }
 }
