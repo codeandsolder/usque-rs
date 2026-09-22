@@ -70,3 +70,32 @@ jobs:
 
       - name: Run tests
         run: cargo test --all
+
+  x86-codegen:
+    name: x86 codegen / ${{ matrix.cpu }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cpu: [x86-64-v2, x86-64-v3]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build golang-go perl \
+            pkg-config clang libclang-dev nasm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: x86-codegen-${{ matrix.cpu }}
+
+      - name: Check target CPU build
+        env:
+          RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
+        run: cargo check --all-targets --all-features --target x86_64-unknown-linux-gnu
