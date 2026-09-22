@@ -17,30 +17,18 @@ pub fn bind_udp_socket(bind_addr: SocketAddr, label: &'static str) -> io::Result
     socket.set_nonblocking(true)?;
 
     log::info!(
-        "configured UDP socket buffers for {} on {}: recv={} send={}",
-        label,
-        bind_addr,
-        recv_buffer_bytes,
-        send_buffer_bytes
+        "configured UDP socket buffers for {label} on {bind_addr}: recv={recv_buffer_bytes} send={send_buffer_bytes}"
     );
 
     if recv_buffer_bytes < UDP_SOCKET_BUFFER_BYTES {
         log::warn!(
-            "actual UDP receive buffer for {} on {} is below requested size: actual={} requested={}",
-            label,
-            bind_addr,
-            recv_buffer_bytes,
-            UDP_SOCKET_BUFFER_BYTES
+            "actual UDP receive buffer for {label} on {bind_addr} is below requested size: actual={recv_buffer_bytes} requested={UDP_SOCKET_BUFFER_BYTES}"
         );
     }
 
     if send_buffer_bytes < UDP_SOCKET_BUFFER_BYTES {
         log::warn!(
-            "actual UDP send buffer for {} on {} is below requested size: actual={} requested={}",
-            label,
-            bind_addr,
-            send_buffer_bytes,
-            UDP_SOCKET_BUFFER_BYTES
+            "actual UDP send buffer for {label} on {bind_addr} is below requested size: actual={send_buffer_bytes} requested={UDP_SOCKET_BUFFER_BYTES}"
         );
     }
 
