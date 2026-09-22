@@ -85,7 +85,7 @@ jobs:
             pkg-config clang libclang-dev nasm
 
       - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0
 
