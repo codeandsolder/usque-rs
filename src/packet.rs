@@ -63,7 +63,7 @@ pub fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, PacketError> {
 }
 
 /// Validate an incoming IP packet (basic checks only).
-pub fn validate_incoming(buf: &[u8]) -> Result<u8, PacketError> {
+pub const fn validate_incoming(buf: &[u8]) -> Result<u8, PacketError> {
     if buf.is_empty() {
         return Err(PacketError::Empty);
     }
