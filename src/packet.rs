@@ -16,7 +16,7 @@ pub enum PacketError {
 }
 
 #[inline]
-pub fn ip_version(buf: &[u8]) -> u8 {
+pub const fn ip_version(buf: &[u8]) -> u8 {
     buf[0] >> 4
 }
 
