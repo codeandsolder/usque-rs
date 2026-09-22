@@ -348,6 +348,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v7.0.1
+
       - name: Detect current stable Rust and queue a full review
         env:
           GH_TOKEN: ${{ github.token }}
