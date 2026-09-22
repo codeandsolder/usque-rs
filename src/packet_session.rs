@@ -834,10 +834,11 @@ mod tests {
 
     fn encode_varint(value: u64) -> Vec<u8> {
         let mut tmp = [0u8; 8];
-        let mut builder = octets::OctetsMut::with_slice(&mut tmp);
-        builder.put_varint(value).unwrap();
-        let len = builder.off();
-        drop(builder);
+        let len = {
+            let mut builder = octets::OctetsMut::with_slice(&mut tmp);
+            builder.put_varint(value).unwrap();
+            builder.off()
+        };
         tmp[..len].to_vec()
     }
 
