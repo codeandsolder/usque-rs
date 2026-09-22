@@ -860,7 +860,7 @@ mod tests {
             0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 64, 0x11, 0x00, 0x00, 10, 0, 0, 1, 10,
             0, 0, 2,
         ]);
-        let datagram = build_flow_datagram(&flow_prefix, packet).unwrap();
+        let datagram = build_flow_datagram(&flow_prefix, &packet).unwrap();
         assert_eq!(datagram[flow_prefix.len() + 8], 63);
     }
 }
