@@ -97,5 +97,5 @@ jobs:
 
       - name: Check target CPU build
         env:
-          RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
         run: cargo check --all-targets --all-features --target x86_64-unknown-linux-gnu
