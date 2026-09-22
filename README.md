@@ -32,6 +32,16 @@ Since my router is a literal **hot potato**, I wanted to get this working with z
 
 Still needs to be measured properly, but it is able to max out my 150 Mbit/s residential downstream and 30 Mbit/s upstream network on a `Cudy WR3000P v1` with some Mediatek 1.3 GHz Dual-Core Cortex-A53 CPU with a load avg of 0.4 during the speedtest. That is good enough for my goals. And memory usage was optimized for as less copies as possible.
 
+## Release binaries
+
+x86-64 releases are built at three ISA levels:
+
+- `usque-rs-x86_64-linux-musl`: portable baseline build.
+- `usque-rs-x86_64-v2-linux-musl`: requires x86-64-v2.
+- `usque-rs-x86_64-v3-linux-musl`: requires x86-64-v3.
+
+Use the highest ISA level supported by the deployment CPU. CPU tuning is explicit in the release workflow; ordinary local builds are not silently compiled for the build machine.
+
 ## Disclaimer
 
 Please do NOT use this tool for abuse. At the end of the day you hurt Cloudflare, which is probably unfair as you get this stuff even for free, secondly you will most likely get this tool sanctioned and ruin the fun for everyone.
