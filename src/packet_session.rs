@@ -192,7 +192,7 @@ impl MasquePacketStream {
         Ok(stream)
     }
 
-    pub fn state(&self) -> PacketSessionState {
+    pub const fn state(&self) -> PacketSessionState {
         self.state
     }
 
@@ -227,7 +227,7 @@ impl MasquePacketStream {
         )
     }
 
-    fn closed_io_error(&self) -> io::Error {
+    fn closed_io_error() -> io::Error {
         io::Error::new(io::ErrorKind::BrokenPipe, "MASQUE stream closed")
     }
 
@@ -439,7 +439,7 @@ impl Stream for MasquePacketStream {
             }
 
             match self.poll_drive(cx) {
-                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(error)) => {
                     self.set_terminal_error(error.to_string());
                 }
@@ -454,7 +454,7 @@ impl Sink<Bytes> for MasquePacketStream {
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.state == PacketSessionState::Closed {
-            return Poll::Ready(Err(self.closed_io_error()));
+            return Poll::Ready(Err(Self::closed_io_error()));
         }
 
         if self.terminal_error.is_some() {
@@ -481,7 +481,7 @@ impl Sink<Bytes> for MasquePacketStream {
 
     fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> io::Result<()> {
         if self.state == PacketSessionState::Closed {
-            return Err(self.closed_io_error());
+            return Err(Self::closed_io_error());
         }
 
         if self.terminal_error.is_some() {
@@ -801,10 +801,11 @@ fn build_flow_datagram(flow_prefix: &[u8], packet: &[u8]) -> Option<Vec<u8>> {
 fn build_flow_prefix(flow_id: u64) -> Vec<u8> {
     let mut prefix = Vec::with_capacity(16);
     let mut tmp = [0u8; 8];
-    let mut builder = octets::OctetsMut::with_slice(&mut tmp);
-    builder.put_varint(flow_id).unwrap();
-    let len = builder.off();
-    drop(builder);
+    let len = {
+        let mut builder = octets::OctetsMut::with_slice(&mut tmp);
+        builder.put_varint(flow_id).unwrap();
+        builder.off()
+    };
     prefix.extend_from_slice(&tmp[..len]);
     prefix.push(0x00);
     prefix
