@@ -79,6 +79,7 @@ fn stage_tun_packet(buf: &mut Vec<u8>, packet: &[u8]) {
 }
 
 const MAX_UDP_BATCH_BYTES: usize = 65_507;
+const UDP_GSO_MAX_SEGMENTS: usize = 64;
 const UDP_RECV_BATCH_SIZE: usize = 32;
 
 fn reset_udp_read_bufs(bufs: &mut [ReadBuf<'_>]) {
@@ -124,7 +125,14 @@ async fn flush_quic_packets(
         let mut done = false;
 
         if udp_gso && segment_size > 0 {
-            let burst_limit = conn.send_quantum().max(segment_size).min(out.len());
+            // Linux UDP GSO supports at most 64 segments per super-buffer.
+            // Byte/send-quantum limits alone can exceed that for small QUIC
+            // ACK/control packets and cause sendmsg(UDP_SEGMENT) to fail EINVAL.
+            let burst_limit = conn
+                .send_quantum()
+                .max(segment_size)
+                .min(out.len())
+                .min(segment_size.saturating_mul(UDP_GSO_MAX_SEGMENTS));
 
             while total + segment_size <= burst_limit {
                 match conn.send(&mut out[total..total + segment_size]) {
