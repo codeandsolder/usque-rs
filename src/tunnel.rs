@@ -2,15 +2,17 @@ use anyhow::{bail, Result};
 use portable_atomic::{AtomicU64, Ordering};
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
 use crate::config::Config;
 use crate::icmp;
 use crate::packet;
 use crate::tls;
-use crate::udp_socket::bind_udp_socket;
+use crate::udp_socket::{bind_udp_socket, detect_udp_gso, send_udp_gso};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -78,48 +80,134 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
+async fn send_tun_batch(
+    tun_dev: &tun_rs::AsyncDevice,
+    gro_table: &mut GROTable,
+    bufs: &mut [Vec<u8>],
+) -> Result<()> {
+    if bufs.is_empty() {
+        return Ok(());
+    }
+
+    tun_dev
+        .send_multiple(gro_table, bufs, VIRTIO_NET_HDR_LEN)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to write packet batch to TUN: {e}"))?;
+    Ok(())
+}
+
+fn stage_tun_packet(buf: &mut Vec<u8>, packet: &[u8]) {
+    buf.clear();
+    buf.resize(VIRTIO_NET_HDR_LEN, 0);
+    buf.extend_from_slice(packet);
+}
+
+const MAX_UDP_BATCH_BYTES: usize = 65_507;
+
+async fn flush_quic_packets(
+    conn: &mut quiche::Connection,
+    socket: &tokio::net::UdpSocket,
+    out: &mut [u8],
+    udp_gso: bool,
+) -> Result<()> {
+    loop {
+        let first_cap = MAX_DATAGRAM_SIZE.min(out.len());
+        let (first_len, first_info) = match conn.send(&mut out[..first_cap]) {
+            Ok(v) => v,
+            Err(quiche::Error::Done) => return Ok(()),
+            Err(e) => bail!("quic send error: {e}"),
+        };
+
+        let segment_size = first_len;
+        let mut total = first_len;
+        let mut done = false;
+
+        if udp_gso && segment_size > 0 {
+            let burst_limit = conn.send_quantum().max(segment_size).min(out.len());
+
+            while total + segment_size <= burst_limit {
+                match conn.send(&mut out[total..total + segment_size]) {
+                    Ok((write, send_info)) => {
+                        // Active migration is disabled in our QUIC config, so all
+                        // packets in a burst must target the same peer.
+                        if send_info.to != first_info.to {
+                            bail!("QUIC destination changed inside a GSO burst");
+                        }
+
+                        total += write;
+                        if write < segment_size {
+                            // UDP GSO permits the final segment to be shorter.
+                            break;
+                        }
+                    }
+                    Err(quiche::Error::BufferTooShort) => {
+                        // A control packet may need a larger buffer than the
+                        // current data segment. Flush this burst and retry it
+                        // with the full configured packet size.
+                        break;
+                    }
+                    Err(quiche::Error::Done) => {
+                        done = true;
+                        break;
+                    }
+                    Err(e) => bail!("quic send error: {e}"),
+                }
+            }
+        }
+
+        if udp_gso && total > segment_size {
+            send_udp_gso(socket, &out[..total], segment_size, first_info.to)
+                .await
+                .map_err(|e| anyhow::anyhow!("UDP GSO send failed: {e}"))?;
+        } else {
+            socket
+                .send_to(&out[..first_len], first_info.to)
+                .await
+                .map_err(|e| anyhow::anyhow!("UDP send failed: {e}"))?;
+        }
+
+        if done {
+            return Ok(());
+        }
+    }
+}
+
 /// Run the MASQUE tunnel, reconnecting on-demand when traffic arrives.
 pub async fn maintain_tunnel(
     config: &Config,
     tunnel_cfg: &TunnelConfig,
-    tun_dev: tun::Device,
+    tun_dev: tun_rs::AsyncDevice,
 ) -> Result<()> {
     if tunnel_cfg.keepalive_period.is_zero() {
         bail!("keepalive period must be greater than zero");
     }
 
-    let async_dev = tun::AsyncDevice::new(tun_dev)
-        .map_err(|e| anyhow::anyhow!("failed to create async TUN device: {e}"))?;
-    let (mut tun_reader, mut tun_writer) = tokio::io::split(async_dev);
-
-    // Buffer for the first packet on reconnection
     let mtu = tunnel_cfg.mtu as usize;
-    let mut pending_pkt: Option<Vec<u8>> = None;
+    let packet_capacity = mtu + 128;
+    let mut pending_packets = VecDeque::new();
+
+    let mut idle_raw = vec![0u8; VIRTIO_NET_HDR_LEN + 65_535];
+    let mut idle_bufs = vec![vec![0u8; packet_capacity]; IDEAL_BATCH_SIZE];
+    let mut idle_sizes = vec![0usize; IDEAL_BATCH_SIZE];
 
     loop {
-        // If we have no pending packet, wait for TUN traffic before connecting
-        if pending_pkt.is_none() {
+        if pending_packets.is_empty() {
             eprint!("\r\x1b[2K[idle] Waiting for traffic...");
-            let mut wait_buf = vec![0u8; mtu + 128];
-            let n = tokio::io::AsyncReadExt::read(&mut tun_reader, &mut wait_buf).await?;
-            if n == 0 {
+            let count = tun_dev
+                .recv_multiple(&mut idle_raw, &mut idle_bufs, &mut idle_sizes, 0)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to read TUN device while idle: {e}"))?;
+            if count == 0 {
                 bail!("TUN device closed");
             }
-            wait_buf.truncate(n);
-            pending_pkt = Some(wait_buf);
+            for i in 0..count {
+                pending_packets.push_back(idle_bufs[i][..idle_sizes[i]].to_vec());
+            }
         }
 
         eprintln!("\r\x1b[2K[connecting] {} ...", tunnel_cfg.endpoint);
 
-        match run_tunnel_session(
-            config,
-            tunnel_cfg,
-            &mut tun_reader,
-            &mut tun_writer,
-            &mut pending_pkt,
-        )
-        .await
-        {
+        match run_tunnel_session(config, tunnel_cfg, &tun_dev, &mut pending_packets).await {
             Ok(()) => {
                 eprintln!("\r\x1b[2K[disconnected] Session ended");
             }
@@ -128,21 +216,15 @@ pub async fn maintain_tunnel(
                 tokio::time::sleep(RECONNECT_DELAY).await;
             }
         }
-        // Loop back to idle
     }
 }
 
-async fn run_tunnel_session<R, W>(
+async fn run_tunnel_session(
     config: &Config,
     tunnel_cfg: &TunnelConfig,
-    tun_reader: &mut R,
-    tun_writer: &mut W,
-    pending_pkt: &mut Option<Vec<u8>>,
-) -> Result<()>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
+    tun_dev: &tun_rs::AsyncDevice,
+    pending_packets: &mut VecDeque<Vec<u8>>,
+) -> Result<()> {
     let tls_material = tls::prepare_tls_material(config)?;
 
     let mut quic_config = tls::build_quic_config(&tls_material, MAX_DATAGRAM_SIZE)?;
@@ -155,6 +237,8 @@ where
     let socket = bind_udp_socket(bind_addr, "masque-native-tunnel")?;
     socket.connect(tunnel_cfg.endpoint).await?;
     let local_addr = socket.local_addr()?;
+    let udp_gso = detect_udp_gso(&socket, MAX_DATAGRAM_SIZE);
+    log::info!("UDP GSO enabled: {udp_gso}");
 
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     ring::rand::SystemRandom::new()
@@ -171,7 +255,7 @@ where
     )
     .map_err(|e| anyhow::anyhow!("quiche connect: {e}"))?;
 
-    let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
+    let mut out = vec![0u8; MAX_UDP_BATCH_BYTES];
     let mut buf = vec![0u8; 65535];
 
     let (write, send_info) = conn
@@ -367,7 +451,7 @@ where
     }
     flow_prefix.push(0x00);
 
-    if let Some(mut pkt) = pending_pkt.take() {
+    while let Some(mut pkt) = pending_packets.pop_front() {
         if packet::prepare_outgoing(&mut pkt).is_ok() {
             let mut dgram = Vec::with_capacity(flow_prefix.len() + pkt.len());
             dgram.extend_from_slice(&flow_prefix);
@@ -380,9 +464,22 @@ where
         }
     }
 
-    // Main data forwarding loop
+    // Main data forwarding loop. Linux offload lets one TUN read contain a
+    // large GSO packet, which tun-rs splits into a burst of MTU-sized packets.
+    // Received CONNECT-IP packets are drained into a GRO batch before crossing
+    // back into the kernel.
     let mtu = tunnel_cfg.mtu as usize;
-    let mut tun_buf = vec![0u8; mtu + 128];
+    let packet_capacity = mtu + 128;
+    let mut tun_raw = vec![0u8; VIRTIO_NET_HDR_LEN + 65_535];
+    let mut tun_packets = vec![vec![0u8; packet_capacity]; IDEAL_BATCH_SIZE];
+    let mut tun_sizes = vec![0usize; IDEAL_BATCH_SIZE];
+
+    let mut gro_table = GROTable::default();
+    let mut inbound_packets = (0..IDEAL_BATCH_SIZE)
+        .map(|_| Vec::with_capacity(VIRTIO_NET_HDR_LEN + packet_capacity))
+        .collect::<Vec<_>>();
+    let mut icmp_packet = vec![Vec::with_capacity(VIRTIO_NET_HDR_LEN + packet_capacity)];
+
     let keepalive_interval = tunnel_cfg.keepalive_period;
 
     let result: Result<()> = async {
@@ -393,47 +490,50 @@ where
                 .min(keepalive_interval);
 
             tokio::select! {
-            // Read from TUN -> send to QUIC
-            result = tokio::io::AsyncReadExt::read(tun_reader, &mut tun_buf) => {
-                let n = result?;
-                if n == 0 {
+            // Read from TUN -> send a burst of CONNECT-IP datagrams.
+            result = tun_dev.recv_multiple(&mut tun_raw, &mut tun_packets, &mut tun_sizes, 0) => {
+                let count = result
+                    .map_err(|e| anyhow::anyhow!("failed to read packet batch from TUN: {e}"))?;
+                if count == 0 {
                     bail!("TUN device closed");
                 }
 
-                let pkt = &mut tun_buf[..n];
-                match packet::prepare_outgoing(pkt) {
-                    Ok(_) => {
-                        let pkt_len = n as u64;
-                        let mut dgram = Vec::with_capacity(flow_prefix.len() + n);
-                        dgram.extend_from_slice(&flow_prefix);
-                        dgram.extend_from_slice(pkt);
+                for i in 0..count {
+                    let n = tun_sizes[i];
+                    let pkt = &mut tun_packets[i][..n];
+                    match packet::prepare_outgoing(pkt) {
+                        Ok(_) => {
+                            let pkt_len = n as u64;
+                            let mut dgram = Vec::with_capacity(flow_prefix.len() + n);
+                            dgram.extend_from_slice(&flow_prefix);
+                            dgram.extend_from_slice(pkt);
 
-                        match conn.dgram_send_buf(dgram) {
-                            Ok(()) => {
-                                stats.tx_packets.fetch_add(1, Ordering::Relaxed);
-                                stats.tx_bytes.fetch_add(pkt_len, Ordering::Relaxed);
-                            }
-                            Err(quiche::Error::InvalidState) => {
-                                log::warn!("datagram send: peer doesn't support datagrams");
-                            }
-                            Err(quiche::Error::Done) => {
-                                stats.dropped.fetch_add(1, Ordering::Relaxed);
-                                log::trace!("datagram send queue full, dropping packet");
-                            }
-                            Err(e) => {
-                                stats.dropped.fetch_add(1, Ordering::Relaxed);
-                                log::debug!("datagram send error: {e}, generating ICMP");
-                                if let Some(icmp_pkt) = icmp::compose_icmp_too_large(&tun_buf[..n], 1280) {
-                                    tokio::io::AsyncWriteExt::write_all(tun_writer, &icmp_pkt)
-                                        .await
-                                        .map_err(|error| anyhow::anyhow!("failed to write ICMP response to TUN: {error}"))?;
+                            match conn.dgram_send_buf(dgram) {
+                                Ok(()) => {
+                                    stats.tx_packets.fetch_add(1, Ordering::Relaxed);
+                                    stats.tx_bytes.fetch_add(pkt_len, Ordering::Relaxed);
+                                }
+                                Err(quiche::Error::InvalidState) => {
+                                    log::warn!("datagram send: peer doesn't support datagrams");
+                                }
+                                Err(quiche::Error::Done) => {
+                                    stats.dropped.fetch_add(1, Ordering::Relaxed);
+                                    log::trace!("datagram send queue full, dropping packet");
+                                }
+                                Err(e) => {
+                                    stats.dropped.fetch_add(1, Ordering::Relaxed);
+                                    log::debug!("datagram send error: {e}, generating ICMP");
+                                    if let Some(icmp) = icmp::compose_icmp_too_large(pkt, 1280) {
+                                        stage_tun_packet(&mut icmp_packet[0], &icmp);
+                                        send_tun_batch(tun_dev, &mut gro_table, &mut icmp_packet).await?;
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        stats.dropped.fetch_add(1, Ordering::Relaxed);
-                        log::trace!("dropping outgoing packet: {e}");
+                        Err(e) => {
+                            stats.dropped.fetch_add(1, Ordering::Relaxed);
+                            log::trace!("dropping outgoing packet: {e}");
+                        }
                     }
                 }
             }
@@ -487,7 +587,8 @@ where
             }
         }
 
-        // Drain received datagrams -> TUN
+        // Drain received datagrams -> one GRO-capable TUN batch.
+        let mut inbound_count = 0usize;
         loop {
             match conn.dgram_recv_buf() {
                 Ok(dgram) => {
@@ -497,9 +598,22 @@ where
                             stats
                                 .rx_bytes
                                 .fetch_add(ip_payload.len() as u64, Ordering::Relaxed);
-                            tokio::io::AsyncWriteExt::write_all(tun_writer, ip_payload)
-                                .await
-                                .map_err(|error| anyhow::anyhow!("failed to write inbound packet to TUN: {error}"))?;
+
+                            stage_tun_packet(
+                                &mut inbound_packets[inbound_count],
+                                ip_payload,
+                            );
+                            inbound_count += 1;
+
+                            if inbound_count == inbound_packets.len() {
+                                send_tun_batch(
+                                    tun_dev,
+                                    &mut gro_table,
+                                    &mut inbound_packets[..inbound_count],
+                                )
+                                .await?;
+                                inbound_count = 0;
+                            }
                         }
                     }
                 }
@@ -511,21 +625,20 @@ where
             }
         }
 
-        // Always flush outgoing QUIC packets
-        loop {
-            match conn.send(&mut out) {
-                Ok((write, send_info)) => {
-                    if let Err(e) = socket.send_to(&out[..write], send_info.to).await {
-                        log::warn!("UDP send error: {e}");
-                        break;
-                    }
-                }
-                Err(quiche::Error::Done) => break,
-                Err(e) => {
-                    log::error!("quic send error: {e}");
-                    bail!("quic send error: {e}");
-                }
-            }
+        if inbound_count > 0 {
+            send_tun_batch(
+                tun_dev,
+                &mut gro_table,
+                &mut inbound_packets[..inbound_count],
+            )
+            .await?;
+        }
+
+        // Always flush outgoing QUIC packets. When Linux UDP GSO is available,
+        // collect a send quantum into one UDP_SEGMENT super-buffer.
+        if let Err(e) = flush_quic_packets(&mut conn, &socket, &mut out, udp_gso).await {
+            log::error!("{e:#}");
+            bail!("{e}");
         }
 
         // Update QUIC-level stats

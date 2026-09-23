@@ -31,7 +31,7 @@ thiserror = "2"
 rcgen = "0.14"
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pem", "std"] }
 x509-cert = { version = "0.3", default-features = false, features = ["pem"] }
-tun = { version = "0.8", features = ["async"] }
+tun-rs = { version = "2.8.8", features = ["async"] }
 rtnetlink = "0.23"
 futures = "0.3"
 tempfile = "3"
@@ -39,6 +39,7 @@ time = "0.3"
 # Software fallback for 64-bit atomics on targets without native support (e.g. armv5te)
 portable-atomic = { version = "1", features = ["fallback"] }
 socket2 = "0.6"
+nix = { version = "0.31.3", features = ["net", "socket", "uio"] }
 
 [profile.release]
 opt-level = 3
