@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 quiche = "0.30.0"
 octets = "0.3"
+bytes = "1"
 
 tokio = { version = "1", features = ["io-util", "net", "macros", "rt-multi-thread", "time"] }
 clap = { version = "4", features = ["derive"] }

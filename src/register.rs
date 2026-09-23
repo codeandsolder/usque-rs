@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use p256::ecdsa::SigningKey;
+use p256::elliptic_curve::Generate;
 use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use ring::rand::SecureRandom;
 use serde::{Deserialize, Serialize};
@@ -192,7 +193,7 @@ pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<Ac
 }
 
 pub fn generate_ec_keypair() -> Result<(Vec<u8>, Vec<u8>)> {
-    let signing_key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+    let signing_key = SigningKey::generate();
 
     let priv_key_der = signing_key
         .to_pkcs8_der()
