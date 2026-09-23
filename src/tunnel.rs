@@ -1,12 +1,10 @@
 use anyhow::{bail, Result};
 use datagram_socket::DatagramSocketRecvExt;
 use futures::FutureExt;
-use portable_atomic::{AtomicU64, Ordering};
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
@@ -26,30 +24,6 @@ pub struct TunnelConfig {
     pub sni: String,
     pub keepalive_period: Duration,
     pub mtu: u32,
-}
-
-struct Stats {
-    tx_packets: AtomicU64,
-    rx_packets: AtomicU64,
-    tx_bytes: AtomicU64,
-    rx_bytes: AtomicU64,
-    dropped: AtomicU64,
-    quic_lost: AtomicU64,
-    quic_retrans: AtomicU64,
-}
-
-impl Stats {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            tx_packets: AtomicU64::new(0),
-            rx_packets: AtomicU64::new(0),
-            tx_bytes: AtomicU64::new(0),
-            rx_bytes: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
-            quic_lost: AtomicU64::new(0),
-            quic_retrans: AtomicU64::new(0),
-        })
-    }
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -440,33 +414,18 @@ async fn run_tunnel_session(
 
     eprintln!("\r\x1b[2K[connected] MASQUE tunnel established");
 
-    let stats = Stats::new();
     let session_start = Instant::now();
+    let mut tx_packets = 0u64;
+    let mut rx_packets = 0u64;
+    let mut tx_bytes = 0u64;
+    let mut rx_bytes = 0u64;
+    let mut dropped = 0u64;
 
-    // Spawn stats display task
-    let stats_display = stats.clone();
-    let stats_handle =
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                let tx_p = stats_display.tx_packets.load(Ordering::Relaxed);
-                let rx_p = stats_display.rx_packets.load(Ordering::Relaxed);
-                let tx_b = stats_display.tx_bytes.load(Ordering::Relaxed);
-                let rx_b = stats_display.rx_bytes.load(Ordering::Relaxed);
-                let dropped = stats_display.dropped.load(Ordering::Relaxed);
-                let lost = stats_display.quic_lost.load(Ordering::Relaxed);
-                let retrans = stats_display.quic_retrans.load(Ordering::Relaxed);
-                let uptime = session_start.elapsed();
-                eprint!(
-                "\r\x1b[2K[connected {}] tx: {} ({})  rx: {} ({})  drop: {}  lost: {}  retrans: {}",
-                format_duration(uptime),
-                tx_p, format_bytes(tx_b),
-                rx_p, format_bytes(rx_b),
-                dropped, lost, retrans,
-            );
-            }
-        });
+    let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
+    stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Tokio intervals tick immediately once; consume that initial tick so the
+    // first display update happens after one second of useful work.
+    stats_interval.tick().await;
 
     // Build the flow_id varint prefix + context_id zero
     let mut flow_prefix = Vec::with_capacity(16);
@@ -486,8 +445,8 @@ async fn run_tunnel_session(
             dgram.extend_from_slice(&pkt);
             let pkt_len = pkt.len() as u64;
             if conn.dgram_send_buf(dgram).is_ok() {
-                stats.tx_packets.fetch_add(1, Ordering::Relaxed);
-                stats.tx_bytes.fetch_add(pkt_len, Ordering::Relaxed);
+                tx_packets += 1;
+                tx_bytes += pkt_len;
             }
         }
     }
@@ -544,18 +503,18 @@ async fn run_tunnel_session(
 
                             match conn.dgram_send_buf(dgram) {
                                 Ok(()) => {
-                                    stats.tx_packets.fetch_add(1, Ordering::Relaxed);
-                                    stats.tx_bytes.fetch_add(pkt_len, Ordering::Relaxed);
+                                    tx_packets += 1;
+                                    tx_bytes += pkt_len;
                                 }
                                 Err(quiche::Error::InvalidState) => {
                                     log::warn!("datagram send: peer doesn't support datagrams");
                                 }
                                 Err(quiche::Error::Done) => {
-                                    stats.dropped.fetch_add(1, Ordering::Relaxed);
+                                    dropped += 1;
                                     log::trace!("datagram send queue full, dropping packet");
                                 }
                                 Err(e) => {
-                                    stats.dropped.fetch_add(1, Ordering::Relaxed);
+                                    dropped += 1;
                                     log::debug!("datagram send error: {e}, generating ICMP");
                                     if let Some(icmp) = icmp::compose_icmp_too_large(pkt, 1280) {
                                         stage_tun_packet(&mut icmp_packet[0], &icmp);
@@ -565,7 +524,7 @@ async fn run_tunnel_session(
                             }
                         }
                         Err(e) => {
-                            stats.dropped.fetch_add(1, Ordering::Relaxed);
+                            dropped += 1;
                             log::trace!("dropping outgoing packet: {e}");
                         }
                     }
@@ -596,6 +555,23 @@ async fn run_tunnel_session(
                     conn.send_ack_eliciting()
                         .map_err(|error| anyhow::anyhow!("failed to schedule QUIC keepalive: {error}"))?;
                 }
+            }
+
+            // Status is sampled once per second instead of maintaining shared
+            // atomics and querying QUIC stats on every packet/event.
+            _ = stats_interval.tick() => {
+                let qs = conn.stats();
+                eprint!(
+                    "\r\x1b[2K[connected {}] tx: {} ({})  rx: {} ({})  drop: {}  lost: {}  retrans: {}",
+                    format_duration(session_start.elapsed()),
+                    tx_packets,
+                    format_bytes(tx_bytes),
+                    rx_packets,
+                    format_bytes(rx_bytes),
+                    dropped,
+                    qs.lost,
+                    qs.retrans,
+                );
             }
         }
 
@@ -642,10 +618,8 @@ async fn run_tunnel_session(
                 Ok(dgram) => {
                     if let Some(ip_payload) = parse_datagram(&dgram, flow_id) {
                         if packet::validate_incoming(ip_payload).is_ok() {
-                            stats.rx_packets.fetch_add(1, Ordering::Relaxed);
-                            stats
-                                .rx_bytes
-                                .fetch_add(ip_payload.len() as u64, Ordering::Relaxed);
+                            rx_packets += 1;
+                            rx_bytes += ip_payload.len() as u64;
 
                             stage_tun_packet(
                                 &mut inbound_packets[inbound_count],
@@ -689,22 +663,13 @@ async fn run_tunnel_session(
             bail!("{e}");
         }
 
-        // Update QUIC-level stats
-        let qs = conn.stats();
-        stats.quic_lost.store(qs.lost as u64, Ordering::Relaxed);
-        stats
-            .quic_retrans
-            .store(qs.retrans as u64, Ordering::Relaxed);
-
-            if conn.is_closed() {
-                break Ok(());
-            }
+        if conn.is_closed() {
+            break Ok(());
         }
+    }
     }
     .await;
 
-    stats_handle.abort();
-    let _ = stats_handle.await;
     result
 }
 

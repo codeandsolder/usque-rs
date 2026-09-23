@@ -36,8 +36,6 @@ rtnetlink = "0.23"
 futures = "0.3"
 tempfile = "3"
 time = "0.3"
-# Software fallback for 64-bit atomics on targets without native support (e.g. armv5te)
-portable-atomic = { version = "1", features = ["fallback"] }
 socket2 = "0.6"
 nix = { version = "0.31.3", features = ["net", "socket", "uio"] }
 datagram-socket = "0.8.0"
