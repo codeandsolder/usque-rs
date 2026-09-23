@@ -32,7 +32,7 @@ hex = "0.4"
 rcgen = "0.13"
 pem = "3"
 x509-parser = "0.16"
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem"] }
 der = { version = "0.7", features = ["pem"] }
 pkcs8 = { version = "0.10", features = ["pem", "std"] }
 tun = { version = "0.7", features = ["async"] }
