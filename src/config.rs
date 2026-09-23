@@ -117,9 +117,13 @@ impl Config {
     }
 
     pub fn get_endpoint_pub_key_der(&self) -> Result<Vec<u8>> {
-        let pem = pem::parse(&self.endpoint_pub_key)
-            .with_context(|| "failed to parse endpoint public key PEM")?;
-        Ok(pem.contents().to_vec())
+        use x509_cert::der::{DecodePem, Encode};
+
+        let spki =
+            x509_cert::spki::SubjectPublicKeyInfoOwned::from_pem(self.endpoint_pub_key.as_bytes())
+                .context("failed to parse endpoint public key PEM")?;
+        spki.to_der()
+            .context("failed to encode endpoint public key as SPKI DER")
     }
 }
 

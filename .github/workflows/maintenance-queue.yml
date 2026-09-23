@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Detect current stable Rust and queue a full review
         env:
@@ -89,7 +89,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -210,125 +210,4 @@ jobs:
             gh issue edit "$actionable" --repo "$REPO" --title "upstream: review new usque-rs changes" --body-file /tmp/upstream-actionable.md
           else
             gh issue create --repo "$REPO" --title "upstream: review new usque-rs changes" --label "automation:upstream" --body-file /tmp/upstream-actionable.md
-          fi
-
-  tooling-queue:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7.0.1
-
-      - name: Prepare labels
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          gh label create "automation:tooling" --repo "$REPO" --color "fbca04" --description "Pinned CI/release tooling update queued automatically" --force
-          gh label create "automation:quarantine" --repo "$REPO" --color "6e7781" --description "Candidate observed but not yet old enough to act on" --force
-
-      - name: Detect and mechanically quarantine tooling drift
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          : >/tmp/tooling-candidate.txt
-          for spec in \
-            actions/checkout \
-            Swatinem/rust-cache \
-            taiki-e/install-action \
-            softprops/action-gh-release
-          do
-            latest="$(gh api "repos/$spec/releases/latest" --jq .tag_name)"
-            found="$(grep -Rho --include='*.yml' "$spec@[^[:space:]]*" .github/workflows | sed "s#$spec@##" | sort -u | paste -sd, -)"
-            if [[ -n "$found" && "$found" != "$latest" ]]; then
-              printf '%s\t%s\t%s\n' "$spec" "$found" "$latest" >>/tmp/tooling-candidate.txt
-            fi
-          done
-
-          marker="maintenance-kind-tooling"
-
-          if [[ ! -s /tmp/tooling-candidate.txt ]]; then
-            gh issue list --repo "$REPO" --state open --limit 100 --search "$marker in:body" --json number --jq '.[].number' |
-            while read -r number; do
-              [[ -n "$number" ]] && gh issue close "$number" --repo "$REPO" --reason completed --comment "Closed automatically: tracked action pins are current."
-            done
-            echo "No tooling drift."
-            exit 0
-          fi
-
-          fingerprint="$(sha256sum /tmp/tooling-candidate.txt | awk '{print $1}')"
-          fpmarker="maintenance-fingerprint-$fingerprint"
-
-          {
-            echo "Pinned GitHub Actions differ from their current stable releases:"
-            while IFS=$'\t' read -r spec current latest; do
-              printf -- '- %s: %s -> %s\n' "$spec" "$current" "$latest"
-            done </tmp/tooling-candidate.txt
-          } >/tmp/tooling-details.txt
-
-          completed="$(gh issue list --repo "$REPO" --state closed --label "automation:tooling" --limit 200 --search "$marker $fpmarker in:body" --json number --jq '.[0].number // empty')"
-          if [[ -n "$completed" ]]; then
-            echo "This exact tooling candidate was already processed as issue #$completed."
-            exit 0
-          fi
-
-          state="$(gh issue list --repo "$REPO" --state open --label "automation:quarantine" --limit 100 --search "$marker $fpmarker in:body" --json number,createdAt --jq '.[0] // empty')"
-
-          if [[ -z "$state" ]]; then
-            gh issue list --repo "$REPO" --state open --limit 100 --search "$marker in:body" --json number --jq '.[].number' |
-            while read -r number; do
-              [[ -n "$number" ]] && gh issue close "$number" --repo "$REPO" --reason completed --comment "Candidate changed before the 72-hour quarantine expired."
-            done
-
-            {
-              echo "<!-- $marker -->"
-              echo "<!-- $fpmarker -->"
-              echo
-              echo "This exact tooling candidate is in the 72-hour mechanical quarantine."
-              echo "A changed candidate restarts the timer."
-              echo
-              cat /tmp/tooling-details.txt
-              echo
-              echo "This is detector state, not maintenance work."
-            } >/tmp/tooling-quarantine.md
-
-            gh issue create --repo "$REPO" --title "quarantine: tooling" --label "automation:quarantine" --body-file /tmp/tooling-quarantine.md
-            echo "First sighting; tooling candidate quarantined."
-            exit 0
-          fi
-
-          created="$(jq -r '.createdAt' <<<"$state")"
-          eligible="$(python3 - "$created" <<'PY'
-          import datetime as dt, sys
-          created=dt.datetime.fromisoformat(sys.argv[1].replace("Z","+00:00"))
-          print("yes" if dt.datetime.now(dt.timezone.utc)-created >= dt.timedelta(hours=72) else "no")
-          PY
-          )"
-
-          if [[ "$eligible" != "yes" ]]; then
-            echo "Tooling candidate is still inside the 72-hour quarantine."
-            exit 0
-          fi
-
-          {
-            echo "<!-- $marker -->"
-            echo "<!-- $fpmarker -->"
-            echo "<!-- automation-queue:tooling -->"
-            echo
-            echo "The following exact action-pin set remained unchanged for at least 72 hours:"
-            echo
-            cat /tmp/tooling-details.txt
-            echo
-            echo "Update exactly these refs together, review major-version migration notes, and run the full CI/release validation."
-            echo "Do not substitute a newer action release than the versions listed here."
-          } >/tmp/tooling-actionable.md
-
-          actionable="$(gh issue list --repo "$REPO" --state open --label "automation:tooling" --limit 100 --search "$marker in:body" --json number --jq '.[0].number // empty')"
-          if [[ -n "$actionable" ]]; then
-            gh issue edit "$actionable" --repo "$REPO" --title "maintenance: update pinned GitHub Actions" --body-file /tmp/tooling-actionable.md
-          else
-            gh issue create --repo "$REPO" --title "maintenance: update pinned GitHub Actions" --label "automation:tooling" --body-file /tmp/tooling-actionable.md
           fi

@@ -121,9 +121,15 @@ pub fn build_quic_config(
 /// Verify a peer's DER certificate against the pinned SPKI public key.
 /// Returns true if the peer cert's `SubjectPublicKeyInfo` matches.
 pub fn verify_endpoint_key(peer_cert_der: &[u8], expected_spki_der: &[u8]) -> bool {
-    let Ok((_, cert)) = x509_parser::parse_x509_certificate(peer_cert_der) else {
+    use x509_cert::der::{Decode, Encode};
+
+    let Ok(cert) = x509_cert::Certificate::from_der(peer_cert_der) else {
         log::warn!("failed to parse peer certificate for key pinning");
         return false;
     };
-    cert.tbs_certificate.subject_pki.raw == expected_spki_der
+    let Ok(spki_der) = cert.tbs_certificate().subject_public_key_info().to_der() else {
+        log::warn!("failed to encode peer certificate public key for key pinning");
+        return false;
+    };
+    spki_der == expected_spki_der
 }

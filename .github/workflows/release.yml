@@ -16,7 +16,7 @@ env:
 jobs:
   build:
     name: Build / ${{ matrix.artifact_name }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     strategy:
       fail-fast: false
@@ -62,20 +62,20 @@ jobs:
             panic_strategy: unwind
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ matrix.toolchain || 'stable' }}
 
       - name: Cache Rust registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-${{ matrix.target }}-${{ matrix.cpu_level || 'baseline' }}
 
       - name: Install cross
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: cross
 
@@ -116,7 +116,7 @@ jobs:
             > "${{ steps.pkg.outputs.archive }}.sha256"
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             ${{ steps.pkg.outputs.archive }}
