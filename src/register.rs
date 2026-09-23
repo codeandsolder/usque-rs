@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use p256::ecdsa::SigningKey;
-use p256::pkcs8::EncodePrivateKey;
+use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use ring::rand::SecureRandom;
 use serde::{Deserialize, Serialize};
 
@@ -103,13 +103,21 @@ fn random_android_serial() -> Result<String> {
     ring::rand::SystemRandom::new()
         .fill(&mut serial)
         .map_err(|_| anyhow::anyhow!("RNG failure"))?;
-    Ok(hex::encode(serial))
+    Ok(format!("{:016x}", u64::from_be_bytes(serial)))
 }
 
 fn cf_time_string() -> String {
-    chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
-        .to_string()
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}+00:00",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+        now.millisecond(),
+    )
 }
 
 fn build_client() -> Result<reqwest::Client> {
@@ -126,7 +134,22 @@ fn build_client() -> Result<reqwest::Client> {
     );
     headers.insert("Connection", HeaderValue::from_static("Keep-Alive"));
 
+    // Reqwest 0.13 defaults to AWS-LC and platform-native roots. Keep the
+    // client self-contained for static router builds while reusing the ring
+    // provider already present elsewhere in the dependency graph.
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let tls = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .context("failed to configure TLS protocol versions")?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+
     reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
         .default_headers(headers)
         .build()
         .context("failed to build HTTP client")
@@ -169,33 +192,20 @@ pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<Ac
 }
 
 pub fn generate_ec_keypair() -> Result<(Vec<u8>, Vec<u8>)> {
-    let signing_key = SigningKey::random(&mut rand::thread_rng());
+    let signing_key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
 
     let priv_key_der = signing_key
         .to_pkcs8_der()
         .context("failed to encode private key to DER")?;
-
-    let pub_key_der = signing_key.verifying_key().to_encoded_point(false);
-    let pub_key_bytes = pub_key_der.as_bytes();
-
-    let spki = der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
-    let curve_oid = der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
-
-    use der::Encode;
-    let algorithm = pkcs8::AlgorithmIdentifierRef {
-        oid: spki,
-        parameters: Some(der::asn1::AnyRef::from(&curve_oid)),
-    };
-    let spki_doc = pkcs8::SubjectPublicKeyInfoRef {
-        algorithm,
-        subject_public_key: der::asn1::BitStringRef::from_bytes(pub_key_bytes)
-            .context("failed to create bit string")?,
-    };
-    let pub_key_spki = spki_doc
-        .to_der()
+    let pub_key_spki = signing_key
+        .verifying_key()
+        .to_public_key_der()
         .context("failed to encode public key to DER")?;
 
-    Ok((priv_key_der.as_bytes().to_vec(), pub_key_spki))
+    Ok((
+        priv_key_der.as_bytes().to_vec(),
+        pub_key_spki.as_bytes().to_vec(),
+    ))
 }
 
 pub async fn enroll_key(
@@ -235,4 +245,27 @@ pub async fn enroll_key(
     resp.json::<AccountData>()
         .await
         .context("failed to parse enrollment response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_client_builds_with_explicit_ring_and_webpki_roots() {
+        build_client().expect("registration HTTP client should build");
+    }
+
+    #[test]
+    fn cloudflare_timestamp_keeps_expected_shape() {
+        let timestamp = cf_time_string();
+        assert_eq!(timestamp.len(), 29);
+        assert!(timestamp.ends_with("+00:00"));
+        assert_eq!(&timestamp[4..5], "-");
+        assert_eq!(&timestamp[7..8], "-");
+        assert_eq!(&timestamp[10..11], "T");
+        assert_eq!(&timestamp[13..14], ":");
+        assert_eq!(&timestamp[16..17], ":");
+        assert_eq!(&timestamp[19..20], ".");
+    }
 }

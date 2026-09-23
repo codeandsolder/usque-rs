@@ -13,36 +13,31 @@ path = "src/main.rs"
 [dependencies]
 quiche = "0.30.0"
 octets = "0.3"
-bytes = "1"
 
 tokio = { version = "1", features = ["io-util", "net", "macros", "rt-multi-thread", "time"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ring = "0.17"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-base64 = "0.22"
+reqwest = { version = "0.13", features = ["json", "rustls-no-provider"], default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+base64 = "0.23"
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
 thiserror = "2"
-chrono = { version = "0.4", features = ["serde"] }
-rand = "0.8"
-hex = "0.4"
-rcgen = "0.13"
-pem = "3"
-x509-parser = "0.16"
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
-der = { version = "0.7", features = ["pem"] }
-pkcs8 = { version = "0.10", features = ["pem", "std"] }
-tun = { version = "0.7", features = ["async"] }
+rcgen = "0.14"
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pem", "std"] }
+x509-cert = { version = "0.3", default-features = false }
+tun = { version = "0.8", features = ["async"] }
 rtnetlink = "0.23"
 futures = "0.3"
 tempfile = "3"
 time = "0.3"
 # Software fallback for 64-bit atomics on targets without native support (e.g. armv5te)
 portable-atomic = { version = "1", features = ["fallback"] }
-socket2 = "0.6.4"
+socket2 = "0.6"
 
 [profile.release]
 opt-level = 3
