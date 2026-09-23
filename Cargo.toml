@@ -40,6 +40,7 @@ time = "0.3"
 portable-atomic = { version = "1", features = ["fallback"] }
 socket2 = "0.6"
 nix = { version = "0.31.3", features = ["net", "socket", "uio"] }
+datagram-socket = "0.8.0"
 
 [profile.release]
 opt-level = 3
