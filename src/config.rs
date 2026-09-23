@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use base64::Engine;
-use p256::pkcs8::{DecodePublicKey, EncodePublicKey};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -118,12 +117,13 @@ impl Config {
     }
 
     pub fn get_endpoint_pub_key_der(&self) -> Result<Vec<u8>> {
-        let key = p256::PublicKey::from_public_key_pem(&self.endpoint_pub_key)
-            .context("failed to parse endpoint P-256 public key PEM")?;
-        let der = key
-            .to_public_key_der()
-            .context("failed to encode endpoint public key as SPKI DER")?;
-        Ok(der.as_bytes().to_vec())
+        use x509_cert::der::{DecodePem, Encode};
+
+        let spki =
+            x509_cert::spki::SubjectPublicKeyInfoOwned::from_pem(self.endpoint_pub_key.as_bytes())
+                .context("failed to parse endpoint public key PEM")?;
+        spki.to_der()
+            .context("failed to encode endpoint public key as SPKI DER")
     }
 }
 
