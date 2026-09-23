@@ -365,7 +365,10 @@ mod tests {
         // This header has checksum 0xfeff at TTL 238. Decrementing TTL makes
         // the canonical recomputed checksum 0x0000; RFC 1141-style arithmetic
         // incorrectly produces 0xffff here.
-        let mut pkt = hex::decode("45000000b9ea0000ee1100000a0000010a000002").unwrap();
+        let mut pkt = vec![
+            0x45, 0x00, 0x00, 0x00, 0xb9, 0xea, 0x00, 0x00, 0xee, 0x11, 0x00, 0x00, 0x0a, 0x00,
+            0x00, 0x01, 0x0a, 0x00, 0x00, 0x02,
+        ];
         let checksum = calculate_ipv4_checksum(&pkt);
         assert_eq!(checksum, 0xfeff);
         pkt[10..12].copy_from_slice(&checksum.to_be_bytes());

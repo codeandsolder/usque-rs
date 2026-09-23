@@ -85,7 +85,7 @@ pub async fn send_udp_gso(
 
         match result {
             Ok(written) => return Ok(written),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(e),
         }
     }

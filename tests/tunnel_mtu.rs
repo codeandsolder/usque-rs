@@ -2,9 +2,6 @@
 //!
 //! **Requires root or CAP_NET_ADMIN** - tests are skipped otherwise.
 
-use std::io::Write;
-use std::os::unix::io::{AsRawFd, FromRawFd};
-
 const IPV4_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 
@@ -77,37 +74,19 @@ fn verify_ipv4_checksum(header: &[u8]) -> bool {
     sum as u16 == 0xFFFF
 }
 
-fn try_create_tun(name: &str, mtu: u16) -> Option<tun::Device> {
-    use tun::AbstractDevice;
-
-    let mut config = tun::Configuration::default();
-    config.layer(tun::Layer::L3);
-    config.tun_name(name);
-
-    #[cfg(target_os = "linux")]
-    config.platform_config(|p| {
-        p.ensure_root_privileges(true);
-    });
-
-    let mut dev = match tun::create(&config) {
-        Ok(d) => d,
+fn try_create_tun(name: &str, mtu: u16) -> Option<tun_rs::SyncDevice> {
+    match tun_rs::DeviceBuilder::new()
+        .name(name)
+        .mtu(mtu)
+        .enable(true)
+        .build_sync()
+    {
+        Ok(dev) => Some(dev),
         Err(e) => {
             eprintln!("Skipping TUN test (no permission): {e}");
-            return None;
+            None
         }
-    };
-
-    if let Err(e) = dev.set_mtu(mtu) {
-        eprintln!("Failed to set MTU: {e}");
-        return None;
     }
-
-    if let Err(e) = dev.enabled(true) {
-        eprintln!("Failed to bring device UP: {e}");
-        return None;
-    }
-
-    Some(dev)
 }
 
 // ---- TUN device tests ----
@@ -119,16 +98,10 @@ fn tun_device_small_mtu_ipv4_write() {
         None => return, // skip if no permissions
     };
 
-    let fd = dev.as_raw_fd();
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-
     let pkt = make_ipv4_packet(100, 64, [10, 200, 0, 1], [10, 200, 0, 2]);
-    let result = file.write(&pkt);
+    let result = dev.send(&pkt);
     assert!(result.is_ok(), "should be able to write small IPv4 to TUN");
     assert_eq!(result.unwrap(), 100);
-
-    // Don't let File close the fd (owned by Device)
-    std::mem::forget(file);
 }
 
 #[test]
@@ -138,15 +111,10 @@ fn tun_device_large_mtu_ipv4_write() {
         None => return,
     };
 
-    let fd = dev.as_raw_fd();
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-
     let pkt = make_ipv4_packet(8000, 64, [10, 200, 0, 1], [10, 200, 0, 2]);
-    let result = file.write(&pkt);
+    let result = dev.send(&pkt);
     assert!(result.is_ok(), "should be able to write jumbo IPv4 to TUN");
     assert_eq!(result.unwrap(), 8000);
-
-    std::mem::forget(file);
 }
 
 #[test]
@@ -156,19 +124,14 @@ fn tun_device_small_mtu_ipv6_write() {
         None => return,
     };
 
-    let fd = dev.as_raw_fd();
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-
     let src = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
     let dst = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
     let pkt = make_ipv6_packet(1280, 64, src, dst);
-    let result = file.write(&pkt);
+    let result = dev.send(&pkt);
     assert!(
         result.is_ok(),
         "should be able to write 1280-byte IPv6 to TUN"
     );
-
-    std::mem::forget(file);
 }
 
 #[test]
@@ -178,16 +141,11 @@ fn tun_device_jumbo_mtu_ipv6_write() {
         None => return,
     };
 
-    let fd = dev.as_raw_fd();
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-
     let src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
     let dst = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
     let pkt = make_ipv6_packet(8000, 64, src, dst);
-    let result = file.write(&pkt);
+    let result = dev.send(&pkt);
     assert!(result.is_ok(), "should be able to write jumbo IPv6 to TUN");
-
-    std::mem::forget(file);
 }
 
 // ---- Full pipeline tests ----
