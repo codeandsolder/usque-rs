@@ -1,6 +1,5 @@
 use anyhow::{bail, Result};
 use datagram_socket::DatagramSocketRecvExt;
-use futures::FutureExt;
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use std::collections::VecDeque;
@@ -483,6 +482,23 @@ async fn run_tunnel_session(
                 .min(keepalive_interval);
 
             tokio::select! {
+            biased;
+
+            // Read a batch from the QUIC UDP socket with recvmmsg().
+            result = async {
+                reset_udp_read_bufs(&mut udp_recv_bufs);
+                socket.recv_many(&mut udp_recv_bufs).await
+            } => {
+                let count = result?;
+                process_udp_batch(
+                    &mut conn,
+                    &mut udp_recv_bufs,
+                    count,
+                    local_addr,
+                    tunnel_cfg.endpoint,
+                );
+            }
+
             // Read from TUN -> send a burst of CONNECT-IP datagrams.
             result = tun_dev.recv_multiple(&mut tun_raw, &mut tun_packets, &mut tun_sizes, 0) => {
                 let count = result
@@ -531,21 +547,6 @@ async fn run_tunnel_session(
                 }
             }
 
-            // Read a batch from the QUIC UDP socket with recvmmsg().
-            result = async {
-                reset_udp_read_bufs(&mut udp_recv_bufs);
-                socket.recv_many(&mut udp_recv_bufs).await
-            } => {
-                let count = result?;
-                process_udp_batch(
-                    &mut conn,
-                    &mut udp_recv_bufs,
-                    count,
-                    local_addr,
-                    tunnel_cfg.endpoint,
-                );
-            }
-
             // QUIC loss-recovery timeout and idle keepalive share the wakeup.
             () = tokio::time::sleep(timeout) => {
                 if quic_timeout.is_some_and(|duration| duration <= keepalive_interval) {
@@ -572,30 +573,6 @@ async fn run_tunnel_session(
                     qs.lost,
                     qs.retrans,
                 );
-            }
-        }
-
-        // After any event, non-blockingly drain pending UDP packets in
-        // recvmmsg() batches. This keeps ACK processing prompt even when the
-        // TUN branch wins the select repeatedly under heavy upload.
-        loop {
-            reset_udp_read_bufs(&mut udp_recv_bufs);
-            match socket.recv_many(&mut udp_recv_bufs).now_or_never() {
-                Some(Ok(0)) | None => break,
-                Some(Ok(count)) => {
-                    process_udp_batch(
-                        &mut conn,
-                        &mut udp_recv_bufs,
-                        count,
-                        local_addr,
-                        tunnel_cfg.endpoint,
-                    );
-                }
-                Some(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Some(Err(error)) => {
-                    log::debug!("UDP batch drain failed: {error}");
-                    break;
-                }
             }
         }
 
