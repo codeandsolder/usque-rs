@@ -34,3 +34,72 @@ pub fn bind_udp_socket(bind_addr: SocketAddr, label: &'static str) -> io::Result
 
     UdpSocket::from_std(socket)
 }
+
+#[cfg(target_os = "linux")]
+pub fn detect_udp_gso(socket: &UdpSocket, segment_size: usize) -> bool {
+    use nix::sys::socket::{setsockopt, sockopt::UdpGsoSegment};
+
+    let Ok(segment_size) = i32::try_from(segment_size) else {
+        return false;
+    };
+
+    setsockopt(socket, UdpGsoSegment, &segment_size).is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn detect_udp_gso(_socket: &UdpSocket, _segment_size: usize) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+pub async fn send_udp_gso(
+    socket: &UdpSocket,
+    buf: &[u8],
+    segment_size: usize,
+    to: SocketAddr,
+) -> io::Result<usize> {
+    use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags, SockaddrStorage};
+    use std::io::IoSlice;
+    use std::os::fd::AsRawFd;
+    use tokio::io::Interest;
+
+    let segment_size = u16::try_from(segment_size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "UDP GSO segment too large"))?;
+    let dst = SockaddrStorage::from(to);
+    let iov = [IoSlice::new(buf)];
+
+    loop {
+        socket.writable().await?;
+
+        let result = socket.try_io(Interest::WRITABLE, || {
+            let cmsg = [ControlMessage::UdpGsoSegments(&segment_size)];
+            sendmsg(
+                socket.as_raw_fd(),
+                &iov,
+                &cmsg,
+                MsgFlags::empty(),
+                Some(&dst),
+            )
+            .map_err(io::Error::from)
+        });
+
+        match result {
+            Ok(written) => return Ok(written),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn send_udp_gso(
+    _socket: &UdpSocket,
+    _buf: &[u8],
+    _segment_size: usize,
+    _to: SocketAddr,
+) -> io::Result<usize> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "UDP GSO is only available on Linux",
+    ))
+}

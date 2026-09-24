@@ -31,13 +31,26 @@ pub fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, PacketError> {
 
     match ip_version(buf) {
         4 => {
-            let header_len = ipv4_header_len(buf)?;
+            ipv4_header_len(buf)?;
             let ttl = buf[8];
             if ttl <= 1 {
                 return Err(PacketError::TtlExpired(ttl));
             }
+            // Only the TTL/protocol 16-bit word changes. Updating the
+            // one's-complement header checksum incrementally avoids rescanning
+            // the entire IPv4 header for every forwarded packet.
+            let old_checksum = u16::from_be_bytes([buf[10], buf[11]]);
+            let old_word = u16::from_be_bytes([buf[8], buf[9]]);
             buf[8] -= 1;
-            let checksum = calculate_ipv4_checksum(&buf[..header_len]);
+            let new_word = u16::from_be_bytes([buf[8], buf[9]]);
+
+            // RFC 1624 Eq. 3: HC' = ~(~HC + ~m + m'). Using the exact
+            // one's-complement form matters for the +0 / -0 edge case.
+            let mut sum = u32::from(!old_checksum) + u32::from(!old_word) + u32::from(new_word);
+            while sum >> 16 != 0 {
+                sum = (sum & 0xFFFF) + (sum >> 16);
+            }
+            let checksum = !(sum as u16);
             buf[10..12].copy_from_slice(&checksum.to_be_bytes());
             Ok(4)
         }
@@ -102,6 +115,7 @@ const fn ipv4_header_len(buf: &[u8]) -> Result<usize, PacketError> {
 
 /// Calculate IPv4 header checksum (RFC 791).
 /// The header slice must contain the complete IHL-indicated IPv4 header.
+#[cfg(test)]
 fn calculate_ipv4_checksum(header: &[u8]) -> u16 {
     let len = header.len();
     let mut sum: u32 = 0;
@@ -159,6 +173,8 @@ mod tests {
         let mut pkt = vec![0u8; 20];
         pkt[0] = 0x45;
         pkt[8] = 64;
+        let checksum = calculate_ipv4_checksum(&pkt);
+        pkt[10..12].copy_from_slice(&checksum.to_be_bytes());
         assert!(prepare_outgoing(&mut pkt).is_ok());
         assert_eq!(pkt[8], 63);
     }
@@ -247,6 +263,8 @@ mod tests {
         pkt[9] = 17;
         pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
         pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        let checksum = calculate_ipv4_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&checksum.to_be_bytes());
         pkt
     }
 
@@ -343,9 +361,32 @@ mod tests {
     }
 
     #[test]
+    fn test_incremental_checksum_handles_negative_zero_edge() {
+        // This header has checksum 0xfeff at TTL 238. Decrementing TTL makes
+        // the canonical recomputed checksum 0x0000; RFC 1141-style arithmetic
+        // incorrectly produces 0xffff here.
+        let mut pkt = vec![
+            0x45, 0x00, 0x00, 0x00, 0xb9, 0xea, 0x00, 0x00, 0xee, 0x11, 0x00, 0x00, 0x0a, 0x00,
+            0x00, 0x01, 0x0a, 0x00, 0x00, 0x02,
+        ];
+        let checksum = calculate_ipv4_checksum(&pkt);
+        assert_eq!(checksum, 0xfeff);
+        pkt[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+        prepare_outgoing(&mut pkt).unwrap();
+
+        let incremental = u16::from_be_bytes([pkt[10], pkt[11]]);
+        let recomputed = calculate_ipv4_checksum(&pkt);
+        assert_eq!(incremental, 0x0000);
+        assert_eq!(incremental, recomputed);
+    }
+
+    #[test]
     fn test_ipv4_checksum_stability_across_ttl_decrements() {
         let mut pkt = make_ipv4(1500);
         pkt[8] = 255;
+        let checksum = calculate_ipv4_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&checksum.to_be_bytes());
         for expected_ttl in (0..255).rev() {
             if expected_ttl == 0 {
                 assert!(prepare_outgoing(&mut pkt).is_err());
@@ -372,6 +413,8 @@ mod tests {
         pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
         pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
         pkt[20..24].copy_from_slice(&[1, 1, 1, 0]);
+        let checksum = calculate_ipv4_checksum(&pkt);
+        pkt[10..12].copy_from_slice(&checksum.to_be_bytes());
 
         prepare_outgoing(&mut pkt).expect("packet with IPv4 options should be accepted");
         let mut sum = 0u32;

@@ -201,7 +201,7 @@ jobs:
             cat /tmp/upstream-details.txt
             echo
             echo "Review and port relevant changes; skip changes that conflict with intentional fork behavior and explain omissions."
-            echo "Preserve the fork's 1 KiB buffers and x86-64-v2/v3 release targets unless an upstream change specifically justifies altering them."
+            echo "Preserve the fork's 1 KiB buffers and x86-64-v2/v3/znver1/znver2 release targets unless an upstream change specifically justifies altering them."
             echo "Do not include newer upstream commits that have not passed their own detector quarantine."
           } >/tmp/upstream-actionable.md
 

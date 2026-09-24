@@ -13,6 +13,7 @@ pub struct Config {
     pub endpoint_v4: String,
     pub endpoint_v6: String,
     pub endpoint_pub_key: String,
+    #[serde(default)]
     pub license: String,
     pub id: String,
     pub access_token: String,
@@ -150,6 +151,26 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn legacy_go_config_without_license_is_accepted() {
+        let json = r#"{
+            "private_key": "key",
+            "endpoint_v4": "192.0.2.1",
+            "endpoint_v6": "2001:db8::1",
+            "endpoint_h2_v4": "192.0.2.1",
+            "endpoint_h2_v6": "",
+            "endpoint_pub_key": "public-key",
+            "id": "device-id",
+            "access_token": "token",
+            "ipv4": "172.16.0.2",
+            "ipv6": "2606:4700:110::2"
+        }"#;
+
+        let cfg: Config = serde_json::from_str(json).expect("legacy Go config");
+        assert_eq!(cfg.license, "");
+        assert_eq!(cfg.endpoint_v4, "192.0.2.1");
     }
 
     #[test]

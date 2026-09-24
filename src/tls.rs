@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::DecodePrivateKey;
+use p256::SecretKey;
 use rcgen::{CertificateParams, KeyPair};
 use std::io::Write;
 use std::time::Duration;
@@ -15,12 +16,23 @@ pub struct TlsMaterial {
     pub endpoint_pub_key_spki_der: Vec<u8>,
 }
 
+fn parse_signing_key(priv_key_der: &[u8]) -> Result<SigningKey> {
+    match SigningKey::from_pkcs8_der(priv_key_der) {
+        Ok(key) => Ok(key),
+        Err(pkcs8_error) => match SecretKey::from_sec1_der(priv_key_der) {
+            Ok(key) => Ok(SigningKey::from(key)),
+            Err(sec1_error) => Err(anyhow::anyhow!(
+                "failed to parse ECDSA private key from config as PKCS#8 ({pkcs8_error}) or SEC1 ({sec1_error})"
+            )),
+        },
+    }
+}
+
 /// Generate self-signed client cert from the config private key and prepare
 /// temp PEM files that quiche can load.
 pub fn prepare_tls_material(config: &Config) -> Result<TlsMaterial> {
     let priv_key_der = config.get_ec_private_key_der()?;
-    let signing_key = SigningKey::from_pkcs8_der(&priv_key_der)
-        .context("failed to parse ECDSA private key from config")?;
+    let signing_key = parse_signing_key(&priv_key_der)?;
 
     let key_pair_pem =
         p256::pkcs8::EncodePrivateKey::to_pkcs8_pem(&signing_key, p256::pkcs8::LineEnding::LF)
@@ -132,4 +144,17 @@ pub fn verify_endpoint_key(peer_cert_der: &[u8], expected_spki_der: &[u8]) -> bo
         return false;
     };
     spki_der == expected_spki_der
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_legacy_sec1_private_key() {
+        let secret = SecretKey::from_slice(&[1u8; 32]).expect("valid P-256 scalar");
+        let sec1 = secret.to_sec1_der().expect("encode SEC1");
+        let parsed = parse_signing_key(sec1.as_ref()).expect("parse legacy SEC1 key");
+        assert_eq!(parsed.to_bytes().as_slice(), secret.to_bytes().as_slice());
+    }
 }

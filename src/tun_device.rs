@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use tun::AbstractDevice;
 
 pub struct TunConfig {
     pub name: Option<String>,
@@ -10,36 +9,29 @@ pub struct TunConfig {
     pub setup_addresses: bool,
 }
 
-pub fn create_tun(cfg: &TunConfig) -> Result<tun::Device> {
-    let mut tun_cfg = tun::Configuration::default();
-
-    tun_cfg.layer(tun::Layer::L3);
+pub fn create_tun(cfg: &TunConfig) -> Result<tun_rs::AsyncDevice> {
+    let mtu = u16::try_from(cfg.mtu).context("TUN MTU does not fit u16")?;
+    let mut builder = tun_rs::DeviceBuilder::new().mtu(mtu).offload(true);
 
     if let Some(ref name) = cfg.name {
-        tun_cfg.tun_name(name);
+        builder = builder.name(name.clone());
     }
 
-    #[cfg(target_os = "linux")]
-    tun_cfg.platform_config(|p| {
-        p.ensure_root_privileges(true);
-    });
-
-    let dev = tun::create(&tun_cfg).context("failed to create TUN device")?;
+    let dev = builder
+        .build_async()
+        .context("failed to create TUN device")?;
 
     log::info!(
-        "TUN device created: {}",
-        dev.tun_name().unwrap_or_else(|_| "unknown".into())
+        "TUN device created with Linux GSO/GRO offload: {}",
+        dev.name()?
     );
     Ok(dev)
 }
 
-pub async fn configure_tun(cfg: &TunConfig, dev: &tun::Device) -> Result<()> {
+pub async fn configure_tun(cfg: &TunConfig, dev: &tun_rs::AsyncDevice) -> Result<()> {
     use futures::stream::TryStreamExt;
 
-    let tun_name = dev
-        .tun_name()
-        .context("failed to get TUN device name")?
-        .clone();
+    let tun_name = dev.name().context("failed to get TUN device name")?;
 
     let (connection, handle, _) =
         rtnetlink::new_connection().context("failed to create netlink connection")?;

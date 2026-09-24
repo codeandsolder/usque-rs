@@ -36,6 +36,18 @@ jobs:
             rustflags: "-C target-cpu=x86-64-v3"
             cpu_level: v3
 
+          # AMD Zen / EPYC specialist builds. These are intentionally
+          # optional; x86-64-v3 remains the portable performance tier.
+          - target: x86_64-unknown-linux-musl
+            artifact_name: usque-rs-x86_64-znver1-linux-musl
+            rustflags: "-C target-cpu=znver1"
+            cpu_level: znver1
+
+          - target: x86_64-unknown-linux-musl
+            artifact_name: usque-rs-x86_64-znver2-linux-musl
+            rustflags: "-C target-cpu=znver2"
+            cpu_level: znver2
+
           # ── 64-bit ARM ───────────────────────────────────────────────────
           - target: aarch64-unknown-linux-musl
             artifact_name: usque-rs-aarch64-linux-musl
