@@ -98,5 +98,6 @@
       "minimumReleaseAge": null,
       "automerge": false
     }
-  ]
+  ],
+  "forkProcessing": "enabled"
 }
