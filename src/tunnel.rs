@@ -88,19 +88,24 @@ fn reset_udp_read_bufs(bufs: &mut [ReadBuf<'_>]) {
     }
 }
 
-fn process_udp_batch(
+fn process_udp_batch<H>(
     conn: &mut quiche::Connection,
     bufs: &mut [ReadBuf<'_>],
     count: usize,
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
-) {
+    datagram_handler: &mut H,
+) where
+    H: FnMut(&[u8]) -> bool,
+{
     for buf in &mut bufs[..count] {
         let recv_info = quiche::RecvInfo {
             to: local_addr,
             from: peer_addr,
         };
-        if let Err(error) = conn.recv(buf.filled_mut(), recv_info) {
+        if let Err(error) =
+            conn.recv_with_dgram_handler(buf.filled_mut(), recv_info, datagram_handler)
+        {
             log::debug!("dropping UDP packet rejected by QUIC: {error}");
         }
     }
@@ -484,6 +489,11 @@ async fn run_tunnel_session(
 
     let result: Result<()> = async {
         loop {
+            // DATAGRAMs consumed synchronously by quiche are staged directly
+            // into this preallocated batch for this forwarding-loop iteration.
+            // Overflow falls back to quiche's regular receive queue.
+            let mut inbound_count = 0usize;
+
             let quic_timeout = conn.timeout();
             let timeout = quic_timeout
                 .unwrap_or(keepalive_interval)
@@ -504,6 +514,29 @@ async fn run_tunnel_session(
                     count,
                     local_addr,
                     tunnel_cfg.endpoint,
+                    &mut |dgram| {
+                        if inbound_count == inbound_packets.len() {
+                            return false;
+                        }
+
+                        let Some(ip_payload) = parse_datagram(dgram, flow_id) else {
+                            return false;
+                        };
+
+                        if packet::validate_incoming(ip_payload).is_err() {
+                            return false;
+                        }
+
+                        rx_packets += 1;
+                        rx_bytes += ip_payload.len() as u64;
+
+                        stage_tun_packet(
+                            &mut inbound_packets[inbound_count],
+                            ip_payload,
+                        );
+                        inbound_count += 1;
+                        true
+                    },
                 );
             }
 
@@ -596,8 +629,19 @@ async fn run_tunnel_session(
             }
         }
 
-        // Drain received datagrams -> one GRO-capable TUN batch.
-        let mut inbound_count = 0usize;
+        // If synchronous DATAGRAM delivery filled the whole TUN batch, flush
+        // it before draining any overflow that fell back to quiche's queue.
+        if inbound_count == inbound_packets.len() {
+            send_tun_batch(
+                tun_dev,
+                &mut gro_table,
+                &mut inbound_packets[..inbound_count],
+            )
+            .await?;
+            inbound_count = 0;
+        }
+
+        // Drain queued fallback datagrams -> the same GRO-capable TUN batch.
         loop {
             match conn.dgram_recv_buf() {
                 Ok(dgram) => {
