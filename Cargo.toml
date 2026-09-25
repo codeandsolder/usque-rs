@@ -46,3 +46,11 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+
+# Recovery-branch-only: pin the exact maintained fork revisions used by the
+# accepted direct-DATAGRAM receive baseline. Do not carry this block into the
+# eventual performance commit; cold-storage uses git-excluded local path patches.
+[patch.crates-io]
+quiche = { git = "https://github.com/codeandsolder/quiche-fast.git", rev = "72c2408e28ab48d550bf2885b8cdd008a7f8a1ee" }
+tun-rs = { git = "https://github.com/codeandsolder/tun-rs-fast.git", rev = "c86b971" }
