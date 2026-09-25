@@ -225,6 +225,9 @@ fn process_udp_batch<H>(
     }
 }
 
+// The native tunnel runs on Tokio's current-thread runtime. Keeping the TX
+// recycle pool Rc/RefCell-local avoids atomics/locks in the packet hot path.
+#[allow(clippy::future_not_send)]
 async fn flush_quic_packets(
     conn: &mut NativeConnection,
     socket: &tokio::net::UdpSocket,
@@ -301,6 +304,7 @@ async fn flush_quic_packets(
 }
 
 /// Run the MASQUE tunnel, reconnecting on-demand when traffic arrives.
+#[allow(clippy::future_not_send)]
 pub async fn maintain_tunnel(
     config: &Config,
     tunnel_cfg: &TunnelConfig,
@@ -347,6 +351,7 @@ pub async fn maintain_tunnel(
     }
 }
 
+#[allow(clippy::future_not_send)]
 async fn run_tunnel_session(
     config: &Config,
     tunnel_cfg: &TunnelConfig,
