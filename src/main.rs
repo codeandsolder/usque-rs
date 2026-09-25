@@ -168,7 +168,9 @@ async fn cmd_register(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+// Native TUN mode intentionally runs on Tokio's current-thread runtime. The
+// TX recycle pool is thread-local so the hot path avoids atomic/locking cost.
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn cmd_nativetun(
     config_path: &str,
     connect_port: u16,
