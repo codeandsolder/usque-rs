@@ -1,9 +1,13 @@
 use anyhow::{bail, Result};
+use bytes::Bytes;
 use datagram_socket::DatagramSocketRecvExt;
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
+use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::mem;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
@@ -16,6 +20,116 @@ use crate::udp_socket::{bind_udp_socket, detect_udp_gso, send_udp_gso};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const TX_POOL_MAX_BATCHES: usize = 8;
+
+#[derive(Clone, Debug, Default)]
+struct PooledBufFactory;
+
+impl quiche::BufFactory for PooledBufFactory {
+    type Buf = Bytes;
+    type DgramBuf = PooledDgramBuf;
+
+    fn buf_from_slice(buf: &[u8]) -> Self::Buf {
+        Bytes::copy_from_slice(buf)
+    }
+
+    fn dgram_buf_from_slice(buf: &[u8]) -> Self::DgramBuf {
+        PooledDgramBuf::from(buf.to_vec())
+    }
+}
+
+type NativeConnection = quiche::Connection<PooledBufFactory>;
+
+#[derive(Debug)]
+struct TxBufferPool {
+    buffers: RefCell<Vec<Vec<u8>>>,
+    buffer_len: usize,
+    prefix: Vec<u8>,
+    max_cached: usize,
+}
+
+impl TxBufferPool {
+    fn new(buffer_len: usize, prefix: &[u8]) -> Rc<Self> {
+        let pool = Rc::new(Self {
+            buffers: RefCell::new(Vec::with_capacity(IDEAL_BATCH_SIZE)),
+            buffer_len,
+            prefix: prefix.to_vec(),
+            max_cached: IDEAL_BATCH_SIZE.saturating_mul(TX_POOL_MAX_BATCHES),
+        });
+
+        {
+            let mut buffers = pool.buffers.borrow_mut();
+            for _ in 0..IDEAL_BATCH_SIZE {
+                buffers.push(pool.new_buffer());
+            }
+        }
+
+        pool
+    }
+
+    fn new_buffer(&self) -> Vec<u8> {
+        let mut buffer = vec![0u8; self.buffer_len];
+        buffer[..self.prefix.len()].copy_from_slice(&self.prefix);
+        buffer
+    }
+
+    fn take(&self) -> Vec<u8> {
+        if let Some(buffer) = self.buffers.borrow_mut().pop() {
+            return buffer;
+        }
+
+        self.new_buffer()
+    }
+
+    fn recycle(&self, mut buffer: Vec<u8>) {
+        buffer.resize(self.buffer_len, 0);
+        buffer[..self.prefix.len()].copy_from_slice(&self.prefix);
+
+        let mut buffers = self.buffers.borrow_mut();
+        if buffers.len() < self.max_cached {
+            buffers.push(buffer);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PooledDgramBuf {
+    buffer: Option<Vec<u8>>,
+    pool: Option<Rc<TxBufferPool>>,
+}
+
+impl PooledDgramBuf {
+    fn pooled(mut buffer: Vec<u8>, used_len: usize, pool: Rc<TxBufferPool>) -> Self {
+        buffer.truncate(used_len);
+        Self {
+            buffer: Some(buffer),
+            pool: Some(pool),
+        }
+    }
+}
+
+impl AsRef<[u8]> for PooledDgramBuf {
+    fn as_ref(&self) -> &[u8] {
+        self.buffer.as_deref().unwrap_or(&[])
+    }
+}
+
+impl From<Vec<u8>> for PooledDgramBuf {
+    fn from(buffer: Vec<u8>) -> Self {
+        Self {
+            buffer: Some(buffer),
+            pool: None,
+        }
+    }
+}
+
+impl Drop for PooledDgramBuf {
+    fn drop(&mut self) {
+        if let (Some(pool), Some(buffer)) = (self.pool.take(), self.buffer.take()) {
+            pool.recycle(buffer);
+        }
+    }
+}
 
 /// Configuration for a MASQUE tunnel session.
 pub struct TunnelConfig {
@@ -89,7 +203,7 @@ fn reset_udp_read_bufs(bufs: &mut [ReadBuf<'_>]) {
 }
 
 fn process_udp_batch<H>(
-    conn: &mut quiche::Connection,
+    conn: &mut NativeConnection,
     bufs: &mut [ReadBuf<'_>],
     count: usize,
     local_addr: SocketAddr,
@@ -112,7 +226,7 @@ fn process_udp_batch<H>(
 }
 
 async fn flush_quic_packets(
-    conn: &mut quiche::Connection,
+    conn: &mut NativeConnection,
     socket: &tokio::net::UdpSocket,
     out: &mut [u8],
     udp_gso: bool,
@@ -260,7 +374,7 @@ async fn run_tunnel_session(
         .map_err(|_| anyhow::anyhow!("RNG failure"))?;
     let scid = quiche::ConnectionId::from_ref(&scid);
 
-    let mut conn = quiche::connect(
+    let mut conn = quiche::connect_with_buffer_factory::<PooledBufFactory>(
         Some(&tunnel_cfg.sni),
         &scid,
         local_addr,
@@ -456,7 +570,7 @@ async fn run_tunnel_session(
             dgram.extend_from_slice(&flow_prefix);
             dgram.extend_from_slice(&pkt);
             let pkt_len = pkt.len() as u64;
-            if conn.dgram_send_buf(dgram).is_ok() {
+            if conn.dgram_send_buf(dgram.into()).is_ok() {
                 tx_packets += 1;
                 tx_bytes += pkt_len;
             }
@@ -469,8 +583,12 @@ async fn run_tunnel_session(
     // back into the kernel.
     let mtu = tunnel_cfg.mtu as usize;
     let packet_capacity = mtu + 128;
+    let prefix_len = flow_prefix.len();
+    let tx_pool = TxBufferPool::new(prefix_len + packet_capacity, &flow_prefix);
     let mut tun_raw = vec![0u8; VIRTIO_NET_HDR_LEN + 65_535];
-    let mut tun_packets = vec![vec![0u8; packet_capacity]; IDEAL_BATCH_SIZE];
+    let mut tun_packets = (0..IDEAL_BATCH_SIZE)
+        .map(|_| tx_pool.new_buffer())
+        .collect::<Vec<_>>();
     let mut tun_sizes = vec![0usize; IDEAL_BATCH_SIZE];
 
     let mut gro_table = GROTable::default();
@@ -541,7 +659,12 @@ async fn run_tunnel_session(
             }
 
             // Read from TUN -> send a burst of CONNECT-IP datagrams.
-            result = tun_dev.recv_multiple(&mut tun_raw, &mut tun_packets, &mut tun_sizes, 0) => {
+            result = tun_dev.recv_multiple(
+                &mut tun_raw,
+                &mut tun_packets,
+                &mut tun_sizes,
+                prefix_len,
+            ) => {
                 let count = result
                     .map_err(|e| anyhow::anyhow!("failed to read packet batch from TUN: {e}"))?;
                 if count == 0 {
@@ -550,13 +673,40 @@ async fn run_tunnel_session(
 
                 for i in 0..count {
                     let n = tun_sizes[i];
-                    let pkt = &mut tun_packets[i][..n];
+                    let packet_start = prefix_len;
+                    let packet_end = packet_start + n;
+                    let pkt = &mut tun_packets[i][packet_start..packet_end];
+
                     match packet::prepare_outgoing(pkt) {
                         Ok(_) => {
                             let pkt_len = n as u64;
-                            let mut dgram = Vec::with_capacity(flow_prefix.len() + n);
-                            dgram.extend_from_slice(&flow_prefix);
-                            dgram.extend_from_slice(pkt);
+                            let dgram_len = prefix_len + n;
+
+                            let Some(max_dgram_len) = conn.dgram_max_writable_len() else {
+                                log::warn!("datagram send: peer doesn't support datagrams");
+                                continue;
+                            };
+
+                            if dgram_len > max_dgram_len {
+                                dropped += 1;
+                                log::debug!(
+                                    "datagram send: payload {dgram_len} exceeds peer limit {max_dgram_len}, generating ICMP"
+                                );
+                                if let Some(icmp) = icmp::compose_icmp_too_large(pkt, 1280) {
+                                    stage_tun_packet(&mut icmp_packet[0], &icmp);
+                                    send_tun_batch(tun_dev, &mut gro_table, &mut icmp_packet).await?;
+                                }
+                                continue;
+                            }
+
+                            let replacement = tx_pool.take();
+                            let completed = mem::replace(&mut tun_packets[i], replacement);
+                            debug_assert_eq!(&completed[..prefix_len], flow_prefix.as_slice());
+                            let dgram = PooledDgramBuf::pooled(
+                                completed,
+                                dgram_len,
+                                Rc::clone(&tx_pool),
+                            );
 
                             match conn.dgram_send_buf(dgram) {
                                 Ok(()) => {
@@ -572,11 +722,7 @@ async fn run_tunnel_session(
                                 }
                                 Err(e) => {
                                     dropped += 1;
-                                    log::debug!("datagram send error: {e}, generating ICMP");
-                                    if let Some(icmp) = icmp::compose_icmp_too_large(pkt, 1280) {
-                                        stage_tun_packet(&mut icmp_packet[0], &icmp);
-                                        send_tun_batch(tun_dev, &mut gro_table, &mut icmp_packet).await?;
-                                    }
+                                    log::debug!("datagram send error after ownership transfer: {e}");
                                 }
                             }
                         }
@@ -645,7 +791,7 @@ async fn run_tunnel_session(
         loop {
             match conn.dgram_recv_buf() {
                 Ok(dgram) => {
-                    if let Some(ip_payload) = parse_datagram(&dgram, flow_id) {
+                    if let Some(ip_payload) = parse_datagram(dgram.as_ref(), flow_id) {
                         if packet::validate_incoming(ip_payload).is_ok() {
                             rx_packets += 1;
                             rx_bytes += ip_payload.len() as u64;
@@ -745,6 +891,26 @@ mod tests {
         dgram.extend_from_slice(&encode_varint(context_id));
         dgram.extend_from_slice(payload);
         dgram
+    }
+
+    #[test]
+    fn pooled_dgram_buffer_returns_storage() {
+        let prefix = [0u8, 0u8];
+        let pool = TxBufferPool::new(64, &prefix);
+        let cached_before = pool.buffers.borrow().len();
+
+        let buffer = pool.take();
+        assert_eq!(pool.buffers.borrow().len(), cached_before - 1);
+
+        {
+            let dgram = PooledDgramBuf::pooled(buffer, 42, Rc::clone(&pool));
+            assert_eq!(dgram.as_ref().len(), 42);
+        }
+
+        assert_eq!(pool.buffers.borrow().len(), cached_before);
+        let recycled = pool.take();
+        assert_eq!(recycled.len(), 64);
+        assert_eq!(&recycled[..prefix.len()], prefix.as_slice());
     }
 
     #[test]
