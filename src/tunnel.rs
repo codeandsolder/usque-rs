@@ -676,6 +676,11 @@ async fn run_tunnel_session(
                     bail!("TUN device closed");
                 }
 
+                // The writable DATAGRAM limit is stable while this TUN batch
+                // is being queued; PMTU/path state is only advanced when the
+                // resulting QUIC packets are flushed afterwards.
+                let max_dgram_len = conn.dgram_max_writable_len();
+
                 for i in 0..count {
                     let n = tun_sizes[i];
                     let packet_start = prefix_len;
@@ -687,7 +692,7 @@ async fn run_tunnel_session(
                             let pkt_len = n as u64;
                             let dgram_len = prefix_len + n;
 
-                            let Some(max_dgram_len) = conn.dgram_max_writable_len() else {
+                            let Some(max_dgram_len) = max_dgram_len else {
                                 log::warn!("datagram send: peer doesn't support datagrams");
                                 continue;
                             };
